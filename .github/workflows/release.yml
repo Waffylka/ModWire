@@ -1,0 +1,76 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: C:/mp-target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Тег збігається з версією в Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: test "v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" = "${{ github.ref_name }}"
+      - run: cargo test
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modwire-windows
+          path: C:/mp-target/release/modwire.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p "Modwire.app/Contents/MacOS" "Modwire.app/Contents/Resources"
+          lipo -create -output "Modwire.app/Contents/MacOS/modwire" \
+            target/aarch64-apple-darwin/release/modwire target/x86_64-apple-darwin/release/modwire
+          # .icns з PNG
+          mkdir icon.iconset
+          for s in 16 32 128 256; do sips -z $s $s assets/icon.png --out icon.iconset/icon_${s}x${s}.png; sips -z $((s*2)) $((s*2)) assets/icon.png --out icon.iconset/icon_${s}x${s}@2x.png; done
+          iconutil -c icns icon.iconset -o "Modwire.app/Contents/Resources/icon.icns"
+          cat > "Modwire.app/Contents/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>Modwire</string>
+            <key>CFBundleExecutable</key><string>modwire</string>
+            <key>CFBundleIdentifier</key><string>dev.modwire.app</string>
+            <key>CFBundleIconFile</key><string>icon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleVersion</key><string>0.1.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          EOF
+          V=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          sed -i '' "s|<string>0.1.0</string>|<string>$V</string>|" "Modwire.app/Contents/Info.plist"
+          codesign --force --deep -s - "Modwire.app"
+          hdiutil create -volname "Modwire" -srcfolder "Modwire.app" -ov -format UDZO Modwire.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modwire-macos
+          path: Modwire.dmg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
