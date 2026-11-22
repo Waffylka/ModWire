@@ -1,0 +1,86 @@
+<div align="center">
+
+# Modwire
+
+**Публікуйте нову версію Minecraft-моду на Modrinth і CurseForge одним натисканням.**
+
+[![Release](https://img.shields.io/github/v/release/Waffylka/ModWire?color=e8a54b&label=%D0%B2%D0%B5%D1%80%D1%81%D1%96%D1%8F)](https://github.com/Waffylka/ModWire/releases/latest)
+[![CI](https://github.com/Waffylka/ModWire/actions/workflows/ci.yml/badge.svg)](https://github.com/Waffylka/ModWire/actions/workflows/ci.yml)
+![Platform](https://img.shields.io/badge/Windows%20%7C%20macOS-1d1a17)
+![Rust](https://img.shields.io/badge/Rust-egui-e8a54b)
+
+[**Завантажити останню версію**](https://github.com/Waffylka/ModWire/releases/latest)
+
+[English](README.md) · **Українська**
+
+</div>
+
+Нативний застосунок на Rust ([egui](https://github.com/emilk/egui)): оберіть файл моду, перевірте версію, сумісність і список змін, і Modwire надішле його одразу на Modrinth та CurseForge.
+
+## Можливості
+
+- **Одна публікація на дві платформи.** Прогрес, швидкість і скасування окремо для кожної платформи; якщо одна не прийняла файл, можна повторити лише її, без дублів на другій.
+- **Автозаповнення з файлу.** З `.jar` і `.mrpack` підтягуються номер версії, назва, точні версії Minecraft і лоадери (Fabric, Quilt, Forge, NeoForge).
+- **Проєкти.** Додавання зі списку Modrinth або за ID CurseForge, закріплення й сортування, значки та назви з API.
+- **Шаблони змін.** Підстановки `{version} {mc} {loaders} {date} {project}`, окремий шаблон для кожного проєкту.
+- **Підказки перед відправкою.** Попередження про повторний або менший номер версії, невідомі версії Minecraft, зрозумілі повідомлення про помилки API.
+- **Історія публікацій** з пошуком і фільтром помилок.
+- **Автооновлення.** Банер «Доступна нова версія» і кнопка «Оновити» (Windows).
+- **Імпорт і експорт проєктів** без токенів, безпечне збереження конфігу з резервною копією.
+- **Клавіатура.** Ctrl/Cmd+Enter публікує, Ctrl/Cmd+1/2/3 перемикає розділи; інтерфейс доступний для скрінрідерів.
+
+## Встановлення
+
+1. Відкрийте [Releases](https://github.com/Waffylka/ModWire/releases/latest).
+2. **Windows:** завантажте `modwire.exe` і запустіть. **macOS:** завантажте `Modwire.dmg`, перетягніть застосунок у «Програми».
+3. Перший запуск: відкрийте «Налаштування» й вставте токени (див. нижче).
+
+Далі застосунок сам повідомляє про нові версії.
+
+### Підпис
+
+Застосунок **не підписаний і не нотаризований**:
+- Windows покаже SmartScreen: «Докладніше» → «Все одно виконати».
+- macOS покаже Gatekeeper: правий клік по `.app` → «Відкрити». На macOS 15+ цього може бути замало: «Системні налаштування → Конфіденційність і безпека» → «Все одно відкрити».
+
+## Налаштування
+
+- **Modrinth:** Personal access token з правами створення версій (Create versions; для списку проєктів ще Read user і Read projects).
+- **CurseForge:** upload API token (curseforge.com/account/api-tokens).
+- **Core API-ключ CurseForge** необов'язковий: лише щоб підтягувати назву й іконку проєкту.
+- **Де зберігається.** `<config_dir>/mod-publisher/config.json`; **токени лежать відкритим текстом** (на Linux/macOS файл створюється з правами 0o600). Запис атомарний, попередній конфіг лишається як `config.backup.json`; при зміні схеми робиться `config.pre-vN.json`, невідомі поля зберігаються. Кнопка «Очистити токени» видаляє токени й копії, що їх містять.
+- **Історія:** `history.jsonl` поряд із конфігом (її можна очистити в застосунку).
+- `.jar` і `.mrpack` читаються лише в пам'яті (кожен запис метаданих до 1 МБ), нічого не розпаковується на диск.
+
+## Збірка з вихідного коду
+
+```powershell
+cargo build --release
+cargo test
+cargo clippy --all-targets
+```
+
+- Windows: рекомендовано короткий шлях для збірки, інакше можливий LNK1104: `$env:CARGO_TARGET_DIR='C:/mp-target'`.
+- macOS: збирається лише на macOS. GitHub Actions (`.github/workflows/release.yml`) робить Windows `.exe` та універсальний `.dmg` (aarch64 + x86_64).
+- Тести перевіряють логіку й мережеві сценарії на локальному моку, реальні API не викликаються.
+- CI (`.github/workflows/ci.yml`): clippy + тести на Windows і macOS при push у `main` і для pull request.
+
+## Випуск нової версії
+
+1. Підніміть `version` у `Cargo.toml` (наприклад, `0.3.0`).
+2. Створіть тег з цією ж версією й запуште його:
+   ```powershell
+   git tag v0.3.0
+   git push origin v0.3.0
+   ```
+3. `release.yml` збере `modwire.exe` і `Modwire.dmg` і додасть їх до релізу. Якщо тег не збігається з версією в `Cargo.toml`, збірка зупиняється.
+
+## Автооновлення
+
+Застосунок перевіряє [Releases](https://github.com/Waffylka/ModWire/releases) при запуску і за кнопкою «Перевірити оновлення» («Налаштування» → «Про застосунок»). Якщо є новіша версія, угорі з'являється банер з кнопкою «Оновити»: файл завантажується, програма підміняє себе й перезапускається. Автозаміна працює у Windows; на macOS кнопка відкриває сторінку релізу. Під час публікації оновлення вимкнено.
+
+Оновлення беруться лише з `https://github.com/Waffylka/ModWire/releases/download/…`; файл перевіряється на розмір і сигнатуру Windows-програми. Підписів і контрольних сум немає: довіра ґрунтується на HTTPS і доступі до цього репозиторію. Адреса репозиторію задається константою `UPDATE_REPO` у `src/logic.rs`.
+
+## Шрифт
+
+Вбудований шрифт Inter (SIL Open Font License 1.1, https://github.com/rsms/inter).

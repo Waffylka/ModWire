@@ -2,55 +2,59 @@
 
 # Modwire
 
-**Публікуйте нову версію Minecraft-моду на Modrinth і CurseForge одним натисканням.**
+**Publish a new version of your Minecraft mod to Modrinth and CurseForge in one click.**
 
-[![Release](https://img.shields.io/github/v/release/Waffylka/ModWire?color=e8a54b&label=%D0%B2%D0%B5%D1%80%D1%81%D1%96%D1%8F)](https://github.com/Waffylka/ModWire/releases/latest)
+[![Release](https://img.shields.io/github/v/release/Waffylka/ModWire?color=e8a54b&label=version)](https://github.com/Waffylka/ModWire/releases/latest)
 [![CI](https://github.com/Waffylka/ModWire/actions/workflows/ci.yml/badge.svg)](https://github.com/Waffylka/ModWire/actions/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/Windows%20%7C%20macOS-1d1a17)
 ![Rust](https://img.shields.io/badge/Rust-egui-e8a54b)
 
-[**Завантажити останню версію**](https://github.com/Waffylka/ModWire/releases/latest)
+[**Download the latest version**](https://github.com/Waffylka/ModWire/releases/latest)
+
+**English** · [Українська](README.uk.md)
 
 </div>
 
-Нативний застосунок на Rust ([egui](https://github.com/emilk/egui)): оберіть файл моду, перевірте версію, сумісність і список змін, і Modwire надішле його одразу на Modrinth та CurseForge.
+A native desktop app written in Rust ([egui](https://github.com/emilk/egui)). Pick your mod file, check the version, compatibility and changelog, and Modwire uploads it to Modrinth and CurseForge at the same time.
 
-## Можливості
+> The app interface is currently in Ukrainian.
 
-- **Одна публікація на дві платформи.** Прогрес, швидкість і скасування окремо для кожної платформи; якщо одна не прийняла файл, можна повторити лише її, без дублів на другій.
-- **Автозаповнення з файлу.** З `.jar` і `.mrpack` підтягуються номер версії, назва, точні версії Minecraft і лоадери (Fabric, Quilt, Forge, NeoForge).
-- **Проєкти.** Додавання зі списку Modrinth або за ID CurseForge, закріплення й сортування, значки та назви з API.
-- **Шаблони змін.** Підстановки `{version} {mc} {loaders} {date} {project}`, окремий шаблон для кожного проєкту.
-- **Підказки перед відправкою.** Попередження про повторний або менший номер версії, невідомі версії Minecraft, зрозумілі повідомлення про помилки API.
-- **Історія публікацій** з пошуком і фільтром помилок.
-- **Автооновлення.** Банер «Доступна нова версія» і кнопка «Оновити» (Windows).
-- **Імпорт і експорт проєктів** без токенів, безпечне збереження конфігу з резервною копією.
-- **Клавіатура.** Ctrl/Cmd+Enter публікує, Ctrl/Cmd+1/2/3 перемикає розділи; інтерфейс доступний для скрінрідерів.
+## Features
 
-## Встановлення
+- **One release, two platforms.** Progress, speed and cancel are tracked per platform. If one platform rejects the file, retry just that one without creating a duplicate on the other.
+- **Autofill from the file.** Version number, name, exact Minecraft versions and loaders (Fabric, Quilt, Forge, NeoForge) are read from `.jar` and `.mrpack` files.
+- **Projects.** Add them from your Modrinth list or by CurseForge ID, pin and sort them, and get icons and names from the APIs.
+- **Changelog templates.** Placeholders `{version} {mc} {loaders} {date} {project}`, with a separate template per project.
+- **Checks before upload.** Warnings for a repeated or lower version number and unknown Minecraft versions, plus readable API error messages.
+- **Publish history** with search and a failures-only filter.
+- **Auto-update.** An "update available" banner with an Update button (Windows).
+- **Import and export of projects** without tokens, and a safe config save with a backup copy.
+- **Keyboard friendly.** Ctrl/Cmd+Enter publishes, Ctrl/Cmd+1/2/3 switches sections; screen reader labels are provided.
 
-1. Відкрийте [Releases](https://github.com/Waffylka/ModWire/releases/latest).
-2. **Windows:** завантажте `modwire.exe` і запустіть. **macOS:** завантажте `Modwire.dmg`, перетягніть застосунок у «Програми».
-3. Перший запуск: відкрийте «Налаштування» й вставте токени (див. нижче).
+## Install
 
-Далі застосунок сам повідомляє про нові версії.
+1. Open [Releases](https://github.com/Waffylka/ModWire/releases/latest).
+2. **Windows:** download `modwire.exe` and run it. **macOS:** download `Modwire.dmg` and drag the app into Applications.
+3. On first launch open **Settings** and paste your tokens (see below).
 
-### Підпис
+After that the app tells you when a new version is available.
 
-Застосунок **не підписаний і не нотаризований**:
-- Windows покаже SmartScreen: «Докладніше» → «Все одно виконати».
-- macOS покаже Gatekeeper: правий клік по `.app` → «Відкрити». На macOS 15+ цього може бути замало: «Системні налаштування → Конфіденційність і безпека» → «Все одно відкрити».
+### Code signing
 
-## Налаштування
+The app is **not signed or notarized**:
+- Windows shows SmartScreen: click "More info" → "Run anyway".
+- macOS shows Gatekeeper: right-click the `.app` → "Open". On macOS 15+ that may not be enough: System Settings → Privacy & Security → "Open Anyway".
 
-- **Modrinth:** Personal access token з правами створення версій (Create versions; для списку проєктів ще Read user і Read projects).
-- **CurseForge:** upload API token (curseforge.com/account/api-tokens).
-- **Core API-ключ CurseForge** необов'язковий: лише щоб підтягувати назву й іконку проєкту.
-- **Де зберігається.** `<config_dir>/mod-publisher/config.json`; **токени лежать відкритим текстом** (на Linux/macOS файл створюється з правами 0o600). Запис атомарний, попередній конфіг лишається як `config.backup.json`; при зміні схеми робиться `config.pre-vN.json`, невідомі поля зберігаються. Кнопка «Очистити токени» видаляє токени й копії, що їх містять.
-- **Історія:** `history.jsonl` поряд із конфігом (її можна очистити в застосунку).
-- `.jar` і `.mrpack` читаються лише в пам'яті (кожен запис метаданих до 1 МБ), нічого не розпаковується на диск.
+## Settings
 
-## Збірка з вихідного коду
+- **Modrinth:** a Personal access token with the Create versions permission (plus Read user and Read projects to list your projects).
+- **CurseForge:** an upload API token (curseforge.com/account/api-tokens).
+- **CurseForge Core API key** is optional and only used to fetch a project's name and icon.
+- **Where data is stored.** `<config_dir>/mod-publisher/config.json`. **Tokens are stored as plain text** (on Linux/macOS the file is created with 0o600 permissions). Writes are atomic, the previous config is kept as `config.backup.json`, a schema change creates `config.pre-vN.json`, and unknown fields are preserved. "Clear tokens" removes the tokens together with the copies that contain them.
+- **History:** `history.jsonl` next to the config (it can be cleared inside the app).
+- `.jar` and `.mrpack` files are read in memory only (each metadata entry is capped at 1 MB) and nothing is extracted to disk.
+
+## Build from source
 
 ```powershell
 cargo build --release
@@ -58,27 +62,27 @@ cargo test
 cargo clippy --all-targets
 ```
 
-- Windows: рекомендовано короткий шлях для збірки, інакше можливий LNK1104: `$env:CARGO_TARGET_DIR='C:/mp-target'`.
-- macOS: збирається лише на macOS. GitHub Actions (`.github/workflows/release.yml`) робить Windows `.exe` та універсальний `.dmg` (aarch64 + x86_64).
-- Тести перевіряють логіку й мережеві сценарії на локальному моку, реальні API не викликаються.
-- CI (`.github/workflows/ci.yml`): clippy + тести на Windows і macOS при push у `main` і для pull request.
+- Windows: a short build path is recommended to avoid LNK1104: `$env:CARGO_TARGET_DIR='C:/mp-target'`.
+- macOS: builds on macOS only. GitHub Actions (`.github/workflows/release.yml`) produces the Windows `.exe` and a universal `.dmg` (aarch64 + x86_64).
+- Tests cover logic and network scenarios against a local mock; real APIs are never called.
+- CI (`.github/workflows/ci.yml`): clippy and tests on Windows and macOS for pushes to `main` and for pull requests.
 
-## Випуск нової версії
+## Releasing a new version
 
-1. Підніміть `version` у `Cargo.toml` (наприклад, `0.3.0`).
-2. Створіть тег з цією ж версією й запуште його:
+1. Bump `version` in `Cargo.toml` (for example `0.3.0`).
+2. Create a tag with the same version and push it:
    ```powershell
    git tag v0.3.0
    git push origin v0.3.0
    ```
-3. `release.yml` збере `modwire.exe` і `Modwire.dmg` і додасть їх до релізу. Якщо тег не збігається з версією в `Cargo.toml`, збірка зупиняється.
+3. `release.yml` builds `modwire.exe` and `Modwire.dmg` and attaches them to the release. If the tag does not match the version in `Cargo.toml`, the build stops.
 
-## Автооновлення
+## Auto-update
 
-Застосунок перевіряє [Releases](https://github.com/Waffylka/ModWire/releases) при запуску і за кнопкою «Перевірити оновлення» («Налаштування» → «Про застосунок»). Якщо є новіша версія, угорі з'являється банер з кнопкою «Оновити»: файл завантажується, програма підміняє себе й перезапускається. Автозаміна працює у Windows; на macOS кнопка відкриває сторінку релізу. Під час публікації оновлення вимкнено.
+The app checks [Releases](https://github.com/Waffylka/ModWire/releases) on startup and on demand (Settings → «Про застосунок» → «Перевірити оновлення»). When a newer version exists, a banner with an Update button appears: the file is downloaded, the app replaces itself and restarts. Automatic replacement works on Windows; on macOS the button opens the release page. Updating is disabled while a publish is running.
 
-Оновлення беруться лише з `https://github.com/Waffylka/ModWire/releases/download/…`; файл перевіряється на розмір і сигнатуру Windows-програми. Підписів і контрольних сум немає: довіра ґрунтується на HTTPS і доступі до цього репозиторію. Адреса репозиторію задається константою `UPDATE_REPO` у `src/logic.rs`.
+Updates are accepted only from `https://github.com/Waffylka/ModWire/releases/download/…`, and the downloaded file is checked for size and the Windows executable signature. There are no signatures or checksums: trust rests on HTTPS and access to this repository. The repository address is the `UPDATE_REPO` constant in `src/logic.rs`.
 
-## Шрифт
+## Font
 
-Вбудований шрифт Inter (SIL Open Font License 1.1, https://github.com/rsms/inter).
+Bundled Inter font (SIL Open Font License 1.1, https://github.com/rsms/inter).
