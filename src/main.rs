@@ -2071,8 +2071,9 @@ impl App {
         if mr { self.up_mr = Up::default(); }
         if cf { self.up_cf = Up::default(); }
         for (on, plat, token, id) in [
-            (mr, P::Mr, self.cfg.modrinth_token.clone(), p.modrinth_id.clone()),
-            (cf, P::Cf, self.cfg.curse_token.clone(), p.curse_id.clone()),
+            // токен обрізаємо так само, як у «Перевірити»: пробіл чи Enter зі вставки ламає заголовок
+            (mr, P::Mr, self.cfg.modrinth_token.trim().to_string(), p.modrinth_id.clone()),
+            (cf, P::Cf, self.cfg.curse_token.trim().to_string(), p.curse_id.clone()),
         ] {
             if !on { continue; }
             self.pending += 1;
