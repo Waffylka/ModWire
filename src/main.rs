@@ -1381,7 +1381,7 @@ impl App {
         let mut close = false;
         let r = egui::Modal::new(egui::Id::unique("add_dialog")).backdrop_color(Color32::from_black_alpha(160)).frame(modal_frame())
             .show(ctx, |ui| {
-                ui.set_width(480.0);
+                ui.set_width((ctx.content_rect().width() - 80.0).clamp(480.0, 720.0)); // ширше, але не більше за вікно
                 ui.horizontal(|ui| {
                     ui.label(title("Додати проєкт"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1435,7 +1435,7 @@ impl App {
                         banner(ui, Kind::Error, &self.mr_msg);
                     }
                     let mut pick = None;
-                    egui::ScrollArea::vertical().id_salt("mr_list").max_height(170.0).auto_shrink([false, true]).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("mr_list").max_height((ctx.content_rect().height() * 0.45).clamp(170.0, 380.0)).auto_shrink([false, true]).show(ui, |ui| {
                         if self.mr_list.is_empty() {
                             if self.mr_loading {
                                 ui.horizontal(|ui| {
