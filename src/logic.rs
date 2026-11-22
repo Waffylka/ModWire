@@ -1475,8 +1475,11 @@ mod tests {
         (out, h.join().unwrap())
     }
 
+    /// Новий тимчасовий файл на кожен виклик: тести йдуть паралельно, а спільний шлях давав гонку
+    /// (один тест перезаписував файл, поки інший його читав: порожній або обрізаний файл).
     fn jar() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("mp_mock_{}.jar", std::process::id()));
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!("mp_mock_{}_{}.jar", std::process::id(), N.fetch_add(1, Relaxed)));
         std::fs::write(&p, [b"PK".as_slice(), &[7u8; 4998]].concat()).unwrap();
         p
     }
