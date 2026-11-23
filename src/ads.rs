@@ -9,12 +9,7 @@ pub struct Sponsor {
     pub url: &'static str,
 }
 
-pub const SPONSOR: Option<Sponsor> = Some(Sponsor {
-    title: "Місце для вашого партнера",
-    text: "Наприклад, хостинг серверів Minecraft",
-    cta: "Докладніше",
-    url: "https://example.com/?ref=modwire", // ЗАГЛУШКА: підставте партнерське посилання
-});
+pub const SPONSOR: Option<Sponsor> = None; // реклама вимкнена: лишаємо лише донати
 
 /// Куди веде «Підтримати автора» (Ko-fi, Patreon, банка тощо). `None` ховає блок.
 pub const DONATE_URL: Option<&str> = Some("https://example.com/donate"); // ЗАГЛУШКА
