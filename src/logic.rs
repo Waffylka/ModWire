@@ -230,8 +230,19 @@ pub fn history_load(n: usize) -> Vec<Value> {
 }
 
 fn history_load_at(p: &Path, n: usize) -> Vec<Value> {
-    let s = std::fs::read_to_string(p).unwrap_or_default();
-    s.lines().rev().filter_map(|l| serde_json::from_str(l).ok()).take(n).collect()
+    // читаємо лише хвіст файлу (старт не залежить від розміру історії); перший рядок вікна може бути обрізаний
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(p) else { return vec![] };
+    let len = f.metadata().map_or(0, |m| m.len());
+    let win = (n as u64 * 1024).max(128 * 1024);
+    let start = len.saturating_sub(win);
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(start)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return vec![];
+    }
+    let s = String::from_utf8_lossy(&buf);
+    let body = if start > 0 { s.split_once('\n').map_or("", |x| x.1) } else { &s };
+    body.lines().rev().filter_map(|l| serde_json::from_str(l).ok()).take(n).collect()
 }
 
 /// Видаляє всю історію публікацій.
@@ -431,6 +442,7 @@ fn human(st: reqwest::StatusCode) -> &'static str {
         409 | 422 => "Така версія вже існує або дані некоректні",
         413 => "Файл завеликий",
         429 => "Забагато запитів, спробуйте пізніше",
+        408 | 502..=504 => "Сервіс тимчасово недоступний (помилка на боці сервера). Зачекайте кілька хвилин і повторіть; статус сервісу дивіться на його сайті",
         500..=599 => "Помилка на боці сервера, спробуйте пізніше",
         _ => "Помилка запиту",
     }
@@ -578,7 +590,7 @@ pub fn parse_game_versions(v: &Value) -> Vec<(String, bool)> {
 
 /// Публічний список версій MC (без токена).
 pub fn game_versions() -> Result<Vec<(String, bool)>, String> {
-    let r = client()?.get(format!("{}/v2/tag/game_version", mr())).send();
+    let r = client_get()?.get(format!("{}/v2/tag/game_version", mr())).send();
     Ok(parse_game_versions(&json_of(r.map_err(net_err)?)?))
 }
 
@@ -852,8 +864,14 @@ fn core() -> String {
     base("https://api.curseforge.com")
 }
 
+/// Для завантаження файлів (довгий таймаут).
 fn client() -> Result<Client, String> {
     client_t(300)
+}
+
+/// Для коротких GET-запитів (перевірка токена, списки, версії): не висимо хвилинами на мертвому з'єднанні.
+fn client_get() -> Result<Client, String> {
+    client_t(30)
 }
 
 fn client_t(secs: u64) -> Result<Client, String> {
@@ -872,7 +890,7 @@ fn sent_err(e: reqwest::Error) -> String {
 
 fn net_err(e: reqwest::Error) -> String {
     if e.is_timeout() || e.is_connect() {
-        format!("Немає зв'язку з сервером (мережа або таймаут). Перевірте інтернет і спробуйте ще раз. ({e})")
+        format!("Немає зв'язку з сервером (мережа або таймаут). Перевірте інтернет, VPN чи брандмауер і спробуйте ще раз. ({e})")
     } else {
         e.to_string()
     }
@@ -894,7 +912,7 @@ fn json_of(resp: reqwest::blocking::Response) -> Result<Value, String> {
         let wait = retry.filter(|_| st.as_u16() == 429).map_or(String::new(), |s| format!(" Зачекайте {s} с."));
         return Err(format!("{}.{wait} (HTTP {st}: {})", human(st), api_msg(&body)));
     }
-    serde_json::from_str(&body).map_err(|e| format!("некоректна відповідь: {e}"))
+    serde_json::from_str(&body).map_err(|e| format!("Сервер повернув не те, що очікувалось (можливо, сторінка проксі чи збій сервісу): {e}. Спробуйте пізніше"))
 }
 
 /// GET із повтором (до 3 спроб) для збоїв мережі, 429 і 5xx. Лише для читання: POST-завантаження не повторюємо.
@@ -918,18 +936,18 @@ fn mr_get(c: &Client, token: &str, path: &str) -> Result<Value, String> {
 }
 
 pub fn modrinth_user(token: &str) -> Result<(String, String), String> {
-    parse_user(&mr_get(&client()?, token, "/user")?).ok_or_else(|| "немає id користувача".into())
+    parse_user(&mr_get(&client_get()?, token, "/user")?).ok_or_else(|| "немає id користувача".into())
 }
 
 /// Перевірка upload-токена: ендпоінт версій вимагає чинний X-Api-Token.
 pub fn curse_token_check(token: &str) -> Result<String, String> {
-    let r = client()?.get(format!("{}/api/game/version-types", cf())).header("X-Api-Token", token).send();
+    let r = client_get()?.get(format!("{}/api/game/version-types", cf())).header("X-Api-Token", token).send();
     json_of(r.map_err(net_err)?).map(|_| "токен приймається".to_string())
 }
 
 /// Перевірка Core API-ключа запитом про гру Minecraft (id 432).
 pub fn curse_key_check(key: &str) -> Result<String, String> {
-    let r = client()?.get(format!("{}/v1/games/432", core())).header("x-api-key", key).send();
+    let r = client_get()?.get(format!("{}/v1/games/432", core())).header("x-api-key", key).send();
     json_of(r.map_err(net_err)?).map(|_| "ключ приймається".to_string())
 }
 
@@ -980,7 +998,7 @@ pub fn version_warning(number: &str, project: &str, last_number: &str, history: 
 }
 
 pub fn curse_mod_info(key: &str, id: &str) -> Result<(String, String), String> {
-    let r = client()?.get(format!("{}/v1/mods/{id}", core())).header("x-api-key", key).send();
+    let r = client_get()?.get(format!("{}/v1/mods/{id}", core())).header("x-api-key", key).send();
     parse_curse_mod(&json_of(r.map_err(net_err)?)?).ok_or_else(|| "немає назви мода".into())
 }
 
@@ -1001,7 +1019,7 @@ pub fn cache_icon(url: &str) {
         return;
     }
     let _ = (|| -> Result<(), String> {
-        let bytes = client()?.get(url).send().and_then(|r| r.error_for_status()).and_then(|r| r.bytes()).map_err(|e| e.to_string())?;
+        let bytes = client_get()?.get(url).send().and_then(|r| r.error_for_status()).and_then(|r| r.bytes()).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
         write_atomic(&p, &bytes).map_err(|e| e.to_string())
     })();
@@ -1073,7 +1091,7 @@ fn preflight(file: &Path, up: &Up) -> Result<(), String> {
 
 pub fn publish_modrinth(token: &str, project_id: &str, r: &Release, file: &Path, up: &Up) -> Result<String, String> {
     preflight(file, up)?;
-    let existing = mr_get(&client()?, token, &format!("/project/{project_id}/version"))?;
+    let existing = mr_get(&client_get()?, token, &format!("/project/{project_id}/version"))?;
     if existing.as_array().is_some_and(|a| a.iter().any(|v| v["version_number"] == r.number.trim() && v["loaders"].as_array().is_some_and(|l| l.iter().any(|x| r.loaders.iter().any(|y| x == y.as_str()))))) {
         return Err(format!("версія {} для цього лоадера вже є на Modrinth, пропущено (змініть номер, якщо це нова збірка)", r.number.trim()));
     }
@@ -1317,20 +1335,31 @@ pub fn apply_update(url: &str, size: u64, sha256: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let (new, old) = (exe.with_extension("exe.new"), exe.with_extension("exe.old"));
     check_writable(exe.parent().ok_or("немає теки програми")?)?;
-    download_to(url, &new, size)?;
-    if !sha256.is_empty() && sha256_file(&new).map_or(true, |h| !h.eq_ignore_ascii_case(sha256)) {
-        let _ = std::fs::remove_file(&new);
+    if UPDATING.swap(true, Relaxed) {
+        return Err("Оновлення вже виконується".into());
+    }
+    let res = download_to(url, &new, size).and_then(|()| install(&exe, &new, &old, sha256));
+    UPDATING.store(false, Relaxed);
+    res
+}
+
+static UPDATING: AtomicBool = AtomicBool::new(false);
+
+/// Перевіряє завантажений `new` (сума, сигнатура) і підміняє ним `exe`; стара копія лишається як `old`.
+fn install(exe: &Path, new: &Path, old: &Path, sha256: &str) -> Result<(), String> {
+    if !sha256.is_empty() && sha256_file(new).map_or(true, |h| !h.eq_ignore_ascii_case(sha256)) {
+        let _ = std::fs::remove_file(new);
         return Err("Контрольна сума завантаженого файлу не збігається з релізом; оновлення скасовано".into());
     }
-    if !valid_exe(&new) {
-        let _ = std::fs::remove_file(&new);
+    if !valid_exe(new) {
+        let _ = std::fs::remove_file(new);
         return Err("Завантажений файл пошкоджений або не є програмою Windows".into());
     }
-    let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old).map_err(|e| format!("Не вдалося замінити програму: {e}"))?;
-    if let Err(e) = std::fs::rename(&new, &exe) {
-        let _ = std::fs::remove_file(&new);
-        if std::fs::rename(&old, &exe).is_err() {
+    let _ = std::fs::remove_file(old);
+    std::fs::rename(exe, old).map_err(|e| format!("Не вдалося замінити програму: {e}"))?;
+    if let Err(e) = std::fs::rename(new, exe) {
+        let _ = std::fs::remove_file(new);
+        if std::fs::rename(old, exe).is_err() {
             return Err(format!("Не вдалося замінити програму: {e}. Якщо modwire.exe зник, перейменуйте {} назад у modwire.exe", old.display()));
         }
         return Err(format!("Не вдалося замінити програму: {e}"));
@@ -2055,6 +2084,88 @@ mod tests {
         std::fs::write(&p, b"PK").unwrap();
         assert!(validate(true, true, &rel(), Some(&p)).is_ok());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn update_install_edge_cases() {
+        let d = std::env::temp_dir().join(format!("mp_inst_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (exe, new, old) = (d.join("modwire.exe"), d.join("modwire.exe.new"), d.join("modwire.exe.old"));
+        let mut b = vec![0u8; 1_200_000];
+        b[..2].copy_from_slice(b"MZ");
+        std::fs::write(&exe, b"old-version").unwrap();
+        // залишок попередньої спроби (.new і .old) не заважає; digest відсутній -> лишаються розмір і сигнатура
+        std::fs::write(&old, b"stale").unwrap();
+        std::fs::write(&new, &b).unwrap();
+        install(&exe, &new, &old, "").unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap().len(), b.len());
+        assert_eq!(std::fs::read(&old).unwrap(), b"old-version");
+        assert!(!new.exists());
+        // невірна сума: exe не чіпаємо, .new прибрано
+        std::fs::write(&new, &b).unwrap();
+        let err = install(&exe, &new, &old, &"0".repeat(64)).unwrap_err();
+        assert!(err.contains("Контрольна сума") && !new.exists());
+        assert_eq!(std::fs::read(&exe).unwrap().len(), b.len());
+        // не exe: те саме
+        std::fs::write(&new, b"PK-not-exe").unwrap();
+        assert!(install(&exe, &new, &old, "").is_err() && !new.exists());
+        // повторний запуск оновлення
+        if cfg!(windows) {
+            UPDATING.store(true, Relaxed);
+            let r = apply_update("https://github.com/Waffylka/ModWire/releases/download/v9.9.9/modwire.exe", 0, "");
+            UPDATING.store(false, Relaxed);
+            assert!(r.unwrap_err().contains("вже виконується"));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn history_reads_only_tail() {
+        let p = std::env::temp_dir().join(format!("mp_hist_tail_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        for i in 0..2000 {
+            history_add_at(&p, "P", &format!("{i}"), "Modrinth", &Ok("x".repeat(200)));
+        }
+        let h = history_load_at(&p, 5);
+        assert_eq!(h.len(), 5);
+        assert_eq!(h[0]["number"], "1999");
+        assert_eq!(h[4]["number"], "1995");
+        let big = history_load_at(&p, 100_000);
+        assert!(big.iter().all(|e| e["project"] == "P"), "обрізаний перший рядок вікна відкинуто");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn config_empty_corrupt_and_two_dirs() {
+        let base = std::env::temp_dir().join(format!("mp_cfg3_{}", std::process::id()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        // порожній і пошкоджений файли: не паніка, дефолтний конфіг, оригінал відкладено в .bak
+        for (name, content) in [("empty", ""), ("junk", "{not json")] {
+            let p = base.join(format!("{name}.json"));
+            std::fs::write(&p, content).unwrap();
+            let (c, st) = load_from(&p);
+            assert!(c.projects.is_empty() && matches!(st, Load::Recovered | Load::Restored));
+            assert!(!p.exists());
+        }
+        // дві копії з різними теками не блокують одна одну; у тій самій теці друга бачить блокування
+        let l1 = lock_at(&a.join(".lock")).unwrap();
+        let l2 = lock_at(&b.join(".lock")).unwrap();
+        assert!(l1.is_some() && l2.is_some());
+        assert!(lock_at(&a.join(".lock")).unwrap().is_none());
+        // збереження в одну теку не торкається іншої
+        let cfg = Config { modrinth_token: "tok".into(), ..Default::default() };
+        save_to(&a.join("config.json"), &cfg).unwrap();
+        assert!(!b.join("config.json").exists());
+        drop((l1, l2));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn api_errors_have_advice() {
+        assert!(human(reqwest::StatusCode::BAD_GATEWAY).contains("Зачекайте"));
+        assert!(human(reqwest::StatusCode::UNAUTHORIZED).contains("Створіть новий токен"));
     }
 
     #[test]

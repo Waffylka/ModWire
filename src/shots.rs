@@ -19,8 +19,20 @@ struct State {
 
 static STATE: OnceLock<Option<Mutex<State>>> = OnceLock::new();
 
-const SIZES: [(f32, f32); 2] = [(900.0, 580.0), (760.0, 480.0)];
-const SCENES: [&str; 6] = ["projects", "publish", "publish_done", "settings", "add_dialog", "empty"];
+/// (сцена, ширина, висота у логічних пікселях). «tall» — високе вікно замість прокрутки: видно всю сторінку.
+const SCENES: &[(&str, f32, f32)] = &[
+    ("projects", 900.0, 580.0), ("projects", 760.0, 480.0),
+    ("projects_tall", 900.0, 1000.0), ("projects_tall", 760.0, 1000.0),
+    ("projects_confirm", 900.0, 1000.0),
+    ("publish", 900.0, 580.0), ("publish", 760.0, 480.0),
+    ("publish_tall", 900.0, 2000.0), ("publish_tall", 760.0, 2000.0),
+    ("publish_done", 900.0, 580.0), ("publish_done", 760.0, 480.0),
+    ("settings", 900.0, 580.0), ("settings", 760.0, 480.0),
+    ("settings_tall", 760.0, 1000.0),
+    ("add_dialog", 900.0, 580.0), ("add_dialog", 760.0, 480.0),
+    ("merge", 900.0, 580.0), ("merge", 760.0, 480.0),
+    ("empty", 900.0, 580.0), ("empty", 760.0, 480.0),
+];
 
 fn state() -> Option<&'static Mutex<State>> {
     STATE
@@ -38,13 +50,24 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
         app.cfg.projects = p; // повертаємо проєкти після порожнього стану
     }
     app.add_open = false;
+    app.merge_ask.clear();
+    app.confirm_del = None;
     app.cfg.modrinth_token.clear(); // діалог «Додати проєкт» сам тягне список, якщо є токен
     app.cfg.curse_token.clear();
     (app.mr_res, app.cf_res, app.msg) = (None, None, String::new());
     app.notice.clear();
     match name {
-        "projects" => app.tab = Tab::Projects,
-        "publish" | "publish_done" | "history" => {
+        "projects" | "projects_tall" => app.tab = Tab::Projects,
+        "projects_confirm" => {
+            app.tab = Tab::Projects;
+            app.confirm_del = Some(0);
+        }
+        "merge" => {
+            app.tab = Tab::Projects;
+            app.merge_hidden = false;
+            app.merge_ask = vec![(0, super::Project { name: "Aurora Lights".into(), curse_id: "999".into(), ..Default::default() })];
+        }
+        "publish" | "publish_tall" | "publish_done" => {
             app.cfg.modrinth_token = "fixture".into();
             app.cfg.curse_token = "fixture".into();
             app.tab = Tab::Publish;
@@ -62,7 +85,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
                 app.mr_res = Some(Ok("Версію створено https://modrinth.com/mod/aurora/version/1".into()));
                 app.cf_res = Some(Err("Сервер відповів HTTP 403: токен не має права завантажувати файли".into()));
             }
-            if name == "history" {
+            {
                 let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                 app.history = vec![
                     serde_json::json!({"ok": true, "project": "Aurora Lights", "number": "1.1.0", "platform": "Modrinth", "t": t - 3600, "msg": ""}),
@@ -71,7 +94,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
                 ];
             }
         }
-        "settings" => {
+        "settings" | "settings_tall" => {
             app.cfg.modrinth_token = "fixture".into();
             app.tab = Tab::Settings;
         }
@@ -98,15 +121,14 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
     app.mc_known = ["1.21.1", "1.20.6", "1.20.4", "1.20.1"].map(String::from).to_vec();
     app.mc_all = app.mc_known.clone();
     ctx.request_repaint();
-    let (scene, size) = (SCENES.get(st.idx / 2), SIZES[st.idx % 2]);
-    let Some(&scene) = scene else {
+    let Some(&(scene, w, h)) = SCENES.get(st.idx) else {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         return;
     };
     if st.frame == 0 {
         let dir = st.dir.clone();
         scene_setup(app, scene, &dir, &mut st.saved_projects);
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(size.0, size.1)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
     }
     st.frame += 1;
     if st.frame == 30 {
@@ -118,7 +140,7 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
     let got = st.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(img) = got {
         let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
-        let path = st.dir.join(format!("{scene}_{}x{}.png", size.0, size.1));
+        let path = st.dir.join(format!("{scene}_{w}x{h}.png"));
         let _ = image::save_buffer(path, &bytes, img.width() as u32, img.height() as u32, image::ColorType::Rgba8);
         (st.idx, st.frame) = (st.idx + 1, 0);
     } else if st.frame > 400 {
