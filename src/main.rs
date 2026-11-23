@@ -1859,7 +1859,9 @@ impl App {
                         let Some(p) = self.cfg.projects.get(i) else { continue };
                         card_hover(col_ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), PROJECT_CARD_H), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            // підтвердження видалення довше за звичайну картку: даємо місце, щоб текст не лягав на бейджі
+                            let card_h = if confirm == Some(i) { PROJECT_CARD_H + 64.0 } else { PROJECT_CARD_H };
+                            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), card_h), egui::Layout::top_down(egui::Align::Min), |ui| {
                                 ui.horizontal(|ui| {
                                     if sel_mode && !p.id.is_empty() {
                                         let mut on = self.picked.contains(&p.id);
