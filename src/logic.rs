@@ -41,6 +41,8 @@ pub struct Last {
     pub mc_versions: String,
     pub loaders: Vec<String>,
     pub release_type: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -82,6 +84,13 @@ pub fn sort_perm(ps: &[Project]) -> Vec<usize> {
     v
 }
 
+/// Закріплені першими; порядок усередині груп лишається ручним (стабільне сортування).
+pub fn pin_perm(ps: &[Project]) -> Vec<usize> {
+    let mut v: Vec<usize> = (0..ps.len()).collect();
+    v.sort_by_key(|&i| !ps[i].pinned);
+    v
+}
+
 /// Для export: прибирає зайві поля, схожі на секрети.
 fn strip_secrets(p: &Project) -> Project {
     let mut q = p.clone();
@@ -92,8 +101,17 @@ fn strip_secrets(p: &Project) -> Project {
     q
 }
 
+/// Тека даних програми. Змінна MODWIRE_CONFIG_DIR (напр. для перевірки на порожніх даних) підміняє
+/// справжню теку конфігу: тоді токени й проєкти користувача не читаються і не змінюються.
+fn data_dir() -> Option<PathBuf> {
+    match std::env::var_os("MODWIRE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(d) => Some(PathBuf::from(d)),
+        None => dirs::config_dir().map(|d| d.join("mod-publisher")),
+    }
+}
+
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("mod-publisher").join("config.json"))
+    data_dir().map(|d| d.join("config.json"))
 }
 
 pub enum Load {
@@ -937,7 +955,11 @@ pub fn curse_mod_info(key: &str, id: &str) -> Result<(String, String), String> {
 pub fn icon_path(url: &str) -> Option<PathBuf> {
     // FNV-1a: стабільний між версіями Rust, на відміну від DefaultHasher
     let h = url.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
-    dirs::cache_dir().map(|d| d.join("mod-publisher").join("icons").join(format!("{h:x}.png")))
+    let base = match std::env::var_os("MODWIRE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(d) => Some(PathBuf::from(d)),
+        None => dirs::cache_dir().map(|d| d.join("mod-publisher")),
+    };
+    base.map(|d| d.join("icons").join(format!("{h:x}.png")))
 }
 
 /// Завантажує іконку в дисковий кеш (якщо ще немає). Помилки ігноруються.
@@ -1090,6 +1112,8 @@ pub struct Update {
     pub url: String,
     /// Розмір файлу з метаданих релізу (0 = невідомий); завантажений файл має збігатися.
     pub size: u64,
+    /// SHA-256 файлу з метаданих релізу (hex, нижній регістр); порожній, якщо GitHub його не повідомив.
+    pub sha256: String,
     pub page: String,
 }
 
@@ -1142,8 +1166,9 @@ pub fn parse_release(v: &Value, repo: &str, current: &str) -> Option<Update> {
     });
     let url = asset.and_then(|x| x["browser_download_url"].as_str());
     let size = asset.and_then(|x| x["size"].as_u64()).unwrap_or(0);
+    let sha256 = asset.and_then(|x| x["digest"].as_str()).and_then(|d| d.strip_prefix("sha256:")).filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())).map_or(String::new(), str::to_lowercase);
     let page = v["html_url"].as_str().filter(|u| u.starts_with("https://github.com/")).map_or_else(|| format!("https://github.com/{repo}/releases/latest"), str::to_string);
-    Some(Update { version: tag.trim_start_matches('v').to_string(), url: url.unwrap_or("").to_string(), size, page })
+    Some(Update { version: tag.trim_start_matches('v').to_string(), url: url.unwrap_or("").to_string(), size, sha256, page })
 }
 
 /// Запитує останній реліз. Ok(None): оновлень немає або репозиторій ще не налаштовано (без мережевого запиту).
@@ -1177,6 +1202,52 @@ fn valid_exe(path: &Path) -> bool {
     (1_000_000..=UPDATE_MAX).contains(&len) && f.read_exact(&mut head).is_ok() && &head == b"MZ"
 }
 
+/// SHA-256 файлу (hex).
+fn sha256_file(p: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    std::io::copy(&mut std::fs::File::open(p)?, &mut h)?;
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Перевіряє, що в теці exe можна створювати файли (інакше заміна не вдасться, напр. Program Files).
+fn check_writable(dir: &Path) -> Result<(), String> {
+    let t = dir.join(format!(".modwire_write_test{}", std::process::id()));
+    std::fs::File::create(&t).map_err(|e| format!("Немає прав на запис у теку програми ({}): {e}. Перемістіть modwire.exe в теку, де можна писати (напр. Документи), або запустіть від імені адміністратора.", dir.display()))?;
+    let _ = std::fs::remove_file(t);
+    Ok(())
+}
+
+/// Відкат: повертає modwire.exe.old на місце exe (нова збірка не стартувала).
+fn rollback_at(exe: &Path) -> Result<(), String> {
+    let old = exe.with_extension("exe.old");
+    if !old.exists() {
+        return Err("Немає копії попередньої версії для відкату".into());
+    }
+    let _ = std::fs::remove_file(exe);
+    std::fs::rename(&old, exe).map_err(|e| format!("Не вдалося повернути попередню версію: {e}. Перейменуйте {} у modwire.exe", old.display()))
+}
+
+/// Запускає щойно встановлену копію і чекає кілька секунд: якщо вона одразу аварійно завершилась,
+/// повертає стару версію й повідомляє про це. Ok = нова копія працює, можна виходити.
+pub fn restart_checked() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut child = std::process::Command::new(&exe).arg("--updated").spawn().map_err(|e| format!("Оновлено, але не вдалося перезапустити: {e}. Запустіть програму вручну."))?;
+    for _ in 0..16 {
+        std::thread::sleep(Duration::from_millis(250));
+        if let Ok(Some(st)) = child.try_wait() {
+            if st.success() {
+                return Ok(());
+            }
+            return Err(match rollback_at(&exe) {
+                Ok(()) => "Нова версія не запустилась; повернуто попередню. Спробуйте пізніше або завантажте оновлення вручну.".into(),
+                Err(e) => e,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn download_to(url: &str, dest: &Path, size: u64) -> Result<(), String> {
     use std::io::{Read, Write};
     let c = client_t(900)?;
@@ -1204,7 +1275,7 @@ fn download_to(url: &str, dest: &Path, size: u64) -> Result<(), String> {
 
 /// Завантажує нову версію й підміняє поточний exe (Windows дозволяє перейменувати працюючий файл).
 /// Після Ok треба запустити exe знову і вийти. Лише адреси з релізів нашого репозиторію.
-pub fn apply_update(url: &str, size: u64) -> Result<(), String> {
+pub fn apply_update(url: &str, size: u64, sha256: &str) -> Result<(), String> {
     if !cfg!(windows) {
         return Err("Автооновлення працює лише у Windows: завантажте нову версію зі сторінки релізу".into());
     }
@@ -1213,7 +1284,12 @@ pub fn apply_update(url: &str, size: u64) -> Result<(), String> {
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let (new, old) = (exe.with_extension("exe.new"), exe.with_extension("exe.old"));
+    check_writable(exe.parent().ok_or("немає теки програми")?)?;
     download_to(url, &new, size)?;
+    if !sha256.is_empty() && sha256_file(&new).map_or(true, |h| !h.eq_ignore_ascii_case(sha256)) {
+        let _ = std::fs::remove_file(&new);
+        return Err("Контрольна сума завантаженого файлу не збігається з релізом; оновлення скасовано".into());
+    }
     if !valid_exe(&new) {
         let _ = std::fs::remove_file(&new);
         return Err("Завантажений файл пошкоджений або не є програмою Windows".into());
@@ -1796,6 +1872,7 @@ mod tests {
         let mut ps = c.projects.clone();
         ps[3].pinned = true; // D
         assert_eq!(sort_perm(&ps), vec![3, 1, 0, 2]); // D, A, b, c
+        assert_eq!(pin_perm(&ps), vec![3, 0, 1, 2], "закріплення не чіпає ручний порядок решти");
         // порядок стабільний при однакових ключах
         assert_eq!(sort_perm(&[Project::default(), Project::default()]), vec![0, 1]);
         let mut q = Project { name: "q".into(), ..Default::default() };
@@ -1911,5 +1988,49 @@ mod tests {
         std::fs::write(d.join("zip.exe"), &b).unwrap();
         assert!(!valid_exe(&d.join("small.exe")) && !valid_exe(&d.join("zip.exe")) && !valid_exe(&d.join("none.exe")));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn update_digest_rollback_and_write_check() {
+        let d = std::env::temp_dir().join(format!("mp_upd2_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        // sha256("abc")
+        std::fs::write(d.join("f"), b"abc").unwrap();
+        assert_eq!(sha256_file(&d.join("f")).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let h = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let rel = json!({"tag_name":"v9.0.0","assets":[{"name":"modwire.exe","size":5,"digest":format!("SHA256:{h}"),"browser_download_url":"https://github.com/o/r/releases/download/v9.0.0/modwire.exe"}]});
+        assert_eq!(parse_release(&rel, "o/r", "1.0.0").unwrap().sha256, "", "некоректний префікс ігнорується");
+        let rel = json!({"tag_name":"v9.0.0","assets":[{"name":"modwire.exe","size":5,"digest":format!("sha256:{}", h.to_uppercase()),"browser_download_url":"https://github.com/o/r/releases/download/v9.0.0/modwire.exe"}]});
+        assert_eq!(parse_release(&rel, "o/r", "1.0.0").unwrap().sha256, h);
+        // відкат: .old повертається на місце зламаного exe
+        let exe = d.join("modwire.exe");
+        std::fs::write(&exe, b"new-broken").unwrap();
+        std::fs::write(exe.with_extension("exe.old"), b"old-good").unwrap();
+        rollback_at(&exe).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old-good");
+        assert!(rollback_at(&exe).is_err(), "без .old відкату немає");
+        assert!(check_writable(&d).is_ok());
+        let e = check_writable(&d.join("немає")).unwrap_err();
+        assert!(e.contains("Немає прав на запис"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn last_keeps_unknown_fields() {
+        let c: Config = serde_json::from_str(r#"{"last":{"dir":"x","future":{"a":1}}}"#).unwrap();
+        assert!(serde_json::to_string(&c).unwrap().contains(r#""future":{"a":1}"#));
+    }
+
+    #[test]
+    fn config_dir_override_redirects_all_paths() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let d = std::env::temp_dir().join(format!("mp_cfgdir_{}", std::process::id()));
+        // shortcut: set_var глобальний; безпечно, бо інші тести не читають цю змінну поза SERIAL
+        unsafe { std::env::set_var("MODWIRE_CONFIG_DIR", &d) };
+        let (cfg, hist, icon) = (config_path(), history_path(), icon_path("http://x/y.png"));
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+        assert_eq!(cfg.unwrap(), d.join("config.json"));
+        assert_eq!(hist.unwrap(), d.join("history.jsonl"));
+        assert!(icon.unwrap().starts_with(d.join("icons")));
     }
 }
