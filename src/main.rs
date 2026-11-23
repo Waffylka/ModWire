@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod logic;
 mod shots;
+mod splash;
 
 use eframe::egui::{self, Color32, RichText, Stroke};
 use logic::*;
@@ -142,6 +143,8 @@ struct App {
     add_shown: bool,
     file_info: Option<JarInfo>, // метадані файлу для попередження про несумісність
     file_note: String,          // що підставлено з файлу (показується в кроці «Файл»)
+    splash: splash::Splash,     // заставка на старті
+    brand_rect: Option<egui::Rect>, // де в рейці маленька іконка (куди «влітає» заставка)
     focus_step: Option<usize>,  // крок, до якого треба прокрутити (клік на «Ще не готово»)
     focus_hist: bool,           // прокрутити до історії (кнопка після успішної публікації)
 }
@@ -787,7 +790,7 @@ impl App {
                 Load::Recovered =>"Конфіг було пошкоджено: копію збережено в теці конфігу (файл .bak), налаштування скинуто.".into(),
                 Load::ReadOnly => "Не вдалося прочитати конфіг: збереження вимкнено, щоб не перезаписати старі дані. Закрийте програми, що тримають файл, і перезапустіть.".into(),
             },
-            readonly: matches!(state, Load::ReadOnly), adding: 0, cf_auto_off: false, cur_idx: None, history: history_load(HIST_MAX), hist_q: String::new(), hist_fail: false, hist_all: false, hist_confirm: false, cur: Default::default(), mc_known: vec![], mc_all: vec![], mc_loading: false, mc_next: None, cf_msg: checked_msg(cfg.curse_checked), key_msg: checked_msg(cfg.core_checked), merge_hidden: false, add_shown: false, file_note: String::new(), file_info: None, focus_step: None, focus_hist: false, open_steps: [true; 6], cfg,
+            readonly: matches!(state, Load::ReadOnly), adding: 0, cf_auto_off: false, cur_idx: None, history: history_load(HIST_MAX), hist_q: String::new(), hist_fail: false, hist_all: false, hist_confirm: false, cur: Default::default(), mc_known: vec![], mc_all: vec![], mc_loading: false, mc_next: None, cf_msg: checked_msg(cfg.curse_checked), key_msg: checked_msg(cfg.core_checked), merge_hidden: false, add_shown: false, file_note: String::new(), splash: splash::Splash::new(), brand_rect: None, file_info: None, focus_step: None, focus_hist: false, open_steps: [true; 6], cfg,
         }
     }
 
@@ -1109,7 +1112,8 @@ impl App {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            ui.add(egui::Image::from_bytes("bytes://modwire-icon.png", include_bytes!("../assets/icon.png").as_slice()).fit_to_exact_size(egui::vec2(32.0, 32.0)).corner_radius(9));
+            let icon = ui.add(egui::Image::from_bytes("bytes://modwire-icon.png", include_bytes!("../assets/icon.png").as_slice()).fit_to_exact_size(egui::vec2(32.0, 32.0)).corner_radius(9));
+            self.brand_rect = Some(icon.rect);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.label(title("Modwire"));
@@ -2536,7 +2540,7 @@ impl eframe::App for App {
             }
         }
         // Ctrl+Enter: з іншого розділу лише відкриває «Публікацію» (щоб побачити підсумок), там уже публікує (якщо форма готова і немає діалогу)
-        if self.pending == 0 && !self.add_open && self.merge_ask.is_empty() && !self.cfg.projects.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) {
+        if self.splash.done() && self.pending == 0 && !self.add_open && self.merge_ask.is_empty() && !self.cfg.projects.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) {
             let proj = self.sel.and_then(|i| self.cfg.projects.get(i));
             let (has_mr, has_cf) = proj.map_or((false, false), |p| (!p.modrinth_id.is_empty(), !p.curse_id.is_empty()));
             let (mr, cf) = (has_mr && self.use_mr, has_cf && self.use_cf);
@@ -2577,6 +2581,7 @@ impl eframe::App for App {
             Tab::Settings => self.settings_ui(ui, ctx),
         } });
         self.merge_dialog(ctx);
+        self.splash.show(ctx, self.brand_rect);
     }
 
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {

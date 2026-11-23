@@ -89,6 +89,7 @@ Updates are accepted only from `https://github.com/Waffylka/ModWire/releases/dow
 - `MODWIRE_CONFIG_DIR` - keep the config, history, icon cache and lock file in another folder instead of `<config_dir>/mod-publisher`.
 - `MODWIRE_SHOT_DIR` - developer screenshot mode: saves PNGs of the main screens to this folder. It only starts when `MODWIRE_CONFIG_DIR` is set too, so your real data is never touched.
 - `MODWIRE_SHOT_SCALE` - UI scale for screenshot mode (for example `1.0`); `MODWIRE_SHOT_ONLY` limits it to scenes whose name starts with that text.
+- `MODWIRE_NO_SPLASH=1` - turn off the animated startup logo (it plays for about 3 seconds; a click or any key skips it). `MODWIRE_SPLASH_AT=<seconds>` freezes it at that moment (used for screenshots).
 
 ## Known limitations
 
