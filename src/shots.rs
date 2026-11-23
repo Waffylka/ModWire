@@ -45,7 +45,7 @@ const SCENES: &[(&str, f32, f32)] = &[
     ("publish_busy", 900.0, 580.0), ("publish_busy", 760.0, 480.0),
     ("close_dialog", 900.0, 580.0),
     ("rollback_dialog", 900.0, 580.0),
-    ("history_empty", 900.0, 2100.0), ("history_errors", 900.0, 2700.0),
+    ("history_big", 900.0, 580.0), ("history_empty", 900.0, 2100.0), ("history_errors", 900.0, 2700.0),
     ("icons", 900.0, 520.0),
 ];
 
@@ -72,7 +72,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
     (app.mr_res, app.cf_res, app.msg) = (None, None, String::new());
     app.notice.clear();
     app.start_act = super::StartAction::Clean;
-    (app.hist_q, app.hist_fail) = (String::new(), false);
+    (app.hist_q, app.hist_fail, app.hist_all) = (String::new(), false, false);
     (app.update, app.upd_applying, app.upd_err, app.pending, app.confirm_close, app.featured) = (None, false, String::new(), 0, false, false);
     match name {
         "projects" | "projects_tall" => app.tab = Tab::Projects,
@@ -85,7 +85,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
             app.merge_hidden = false;
             app.merge_ask = vec![(0, super::Project { name: "Aurora Lights".into(), curse_id: "999".into(), ..Default::default() })];
         }
-        "publish" | "publish_tall" | "publish_done" | "publish_busy" | "close_dialog" | "rollback_dialog" | "history_empty" | "history_errors" => {
+        "publish" | "publish_tall" | "publish_done" | "publish_busy" | "close_dialog" | "rollback_dialog" | "history_big" | "history_empty" | "history_errors" => {
             app.cfg.modrinth_token = "fixture".into();
             app.cfg.curse_token = "fixture".into();
             app.tab = Tab::Publish;
@@ -93,7 +93,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
             if app.file.is_none() {
                 let f = dir.join("aurora-lights-1.2.0.jar");
                 let _ = std::fs::write(&f, b"fixture");
-                app.set_file(f);
+                app.set_file(f, None);
                 app.number = "1.2.0".into();
                 app.changelog = "- Нові ефекти світла\n- Виправлено вильоти при завантаженні світу".into();
                 app.cfg.last.mc_versions = "1.20.1, 1.20.4".into();
@@ -126,6 +126,13 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
                     serde_json::json!({"ok": false, "project": "Aurora Lights", "number": "1.1.0", "platform": "CurseForge", "t": t - 3500, "msg": "HTTP 403: токен не має права"}),
                     serde_json::json!({"ok": true, "project": "Stone Tools Plus", "number": "0.9.2", "platform": "Modrinth", "t": t - 86400 * 3, "msg": ""}),
                 ];
+                if name == "history_big" {
+                    // перевірка швидкості: повний ліміт історії в пам'яті, усі рядки розкриті
+                    app.hist_all = true;
+                    for k in 0..300u64 {
+                        app.history.push(serde_json::json!({"ok": k % 4 != 0, "project": format!("Проєкт {k}"), "number": format!("1.{k}.0"), "platform": if k % 2 == 0 { "Modrinth" } else { "CurseForge" }, "t": t - 600 * (k + 1), "msg": if k % 4 != 0 { "" } else { "HTTP 403: токен не має права" }}));
+                    }
+                }
                 if name == "history_errors" {
                     let long = "HTTP 400: поле game_versions містить версію 1.20.9, якої не існує на Modrinth; перевірте список версій Minecraft і спробуйте ще раз після виправлення (довге повідомлення для перевірки переносу).";
                     for k in 0..8u64 {
@@ -139,9 +146,12 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
         "settings" | "settings_tall" | "settings_update" | "settings_updating" | "settings_updateerr" => {
             app.cfg.modrinth_token = "fixture".into();
             app.tab = Tab::Settings;
-            if name.starts_with("settings_update") {
+            if name.starts_with("settings_upd") {
                 app.update = Some(super::Update { version: "0.4.0".into(), url: "https://example.invalid/modwire.exe".into(), size: 0, sha256: String::new(), page: "https://example.invalid/release".into() });
                 app.upd_applying = name == "settings_updating";
+                if app.upd_applying {
+                    super::set_update_progress(7 << 20, 12 << 20);
+                }
                 if name == "settings_updateerr" {
                     app.upd_err = "Не вдалося встановити оновлення: немає прав на запис у теку програми.".into();
                 }

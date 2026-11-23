@@ -120,6 +120,12 @@ pub fn update_visible(version: &str, skipped: &str, manual: bool) -> bool {
     manual || skipped.trim_start_matches('v') != version.trim_start_matches('v')
 }
 
+/// М'яке попередження перед публікацією: токен вибраної платформи ще жодного разу не перевіряли (0 = не перевірявся).
+pub fn unchecked_tokens(mr: bool, cf: bool, mr_checked: u64, cf_checked: u64) -> Option<String> {
+    let names: Vec<&str> = [(mr && mr_checked == 0, "Modrinth"), (cf && cf_checked == 0, "CurseForge")].into_iter().filter(|x| x.0).map(|x| x.1).collect();
+    (!names.is_empty()).then(|| format!("Токен {} не перевірено: «Налаштування» → «Перевірити» (так права видно до публікації).", names.join(" і ")))
+}
+
 /// Прибирає секрети з тексту помилки (сервер може повернути у тілі те, що ми надіслали в заголовку).
 pub fn mask_secrets(text: &str, secrets: &[&str]) -> String {
     secrets.iter().map(|s| s.trim()).filter(|s| s.len() >= 4).fold(text.to_string(), |t, s| t.replace(s, "•••"))
@@ -1315,7 +1321,7 @@ fn sent_err(e: reqwest::Error) -> String {
 const NET_ADVICE: &str = "Немає зв'язку з сервером (мережа або таймаут). Перевірте інтернет, VPN чи брандмауер і спробуйте ще раз.";
 
 fn net_err(e: reqwest::Error) -> String {
-    if e.is_timeout() || e.is_connect() {
+    if e.is_timeout() || e.is_connect() || e.is_body() || e.is_decode() {
         format!("{NET_ADVICE} ({e})")
     } else {
         e.to_string()
@@ -1333,7 +1339,7 @@ fn api_msg(body: &str) -> String {
 fn json_of(resp: reqwest::blocking::Response) -> Result<Value, String> {
     let st = resp.status();
     let retry = resp.headers().get("retry-after").and_then(|h| h.to_str().ok()).map(str::to_string);
-    let body = resp.text().map_err(|e| e.to_string())?;
+    let body = resp.text().map_err(net_err)?;
     if !st.is_success() {
         let wait = retry.filter(|_| st.as_u16() == 429).map_or(String::new(), |s| format!(" Зачекайте {s} с."));
         return Err(format!("{}.{wait} (HTTP {st}: {})", human(st), api_msg(&body)));
@@ -1925,6 +1931,12 @@ pub fn update_progress() -> (u64, u64) {
     (UPD_DONE.load(Relaxed), UPD_TOTAL.load(Relaxed))
 }
 
+/// Лише для режиму знімків: підставити прогрес.
+pub fn set_update_progress(done: u64, total: u64) {
+    UPD_DONE.store(done, Relaxed);
+    UPD_TOTAL.store(total, Relaxed);
+}
+
 fn download_to(url: &str, dest: &Path, size: u64) -> Result<(), String> {
     use std::io::{Read, Write};
     let c = client_open(900)?;
@@ -1938,7 +1950,8 @@ fn download_to(url: &str, dest: &Path, size: u64) -> Result<(), String> {
         let mut out = std::fs::File::create(dest).map_err(|e| format!("Не вдалося записати файл оновлення поруч із програмою: {e}"))?;
         let (mut src, mut buf, mut n) = (resp.take(UPDATE_MAX + 1), vec![0u8; 64 * 1024], 0u64);
         loop {
-            let k = src.read(&mut buf).map_err(|e| e.to_string())?;
+            // обрив посеред завантаження: та сама порада про мережу, що й для запиту
+            let k = src.read(&mut buf).map_err(|e| format!("{NET_ADVICE} ({e})"))?;
             if k == 0 {
                 break;
             }
@@ -3602,5 +3615,116 @@ mod tests {
         std::fs::write(&p, huge).unwrap();
         let h = history_load_at(&p, 5);
         assert!(h.len() <= 2, "надвеликий хвостовий рядок обрізається вікном і пропускається");
+    }
+
+    // ----- вимірювання (cargo test --release -- --ignored --nocapture bench_) -----
+    fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
+        let t = std::time::Instant::now();
+        let r = f();
+        eprintln!("BENCH {label}: {:?}", t.elapsed());
+        r
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_config_and_history() {
+        let d = tmp_dir("bench_cfg");
+        let mut cfg = Config::default();
+        for i in 0..200 {
+            cfg.projects.push(Project { name: format!("Проєкт {i}"), modrinth_id: format!("mr{i}"), curse_id: format!("{i}"), icon_url: format!("https://cdn.example/{i}.png"), changelog_template: "x".repeat(300), ..Default::default() });
+        }
+        cfg.modrinth_token = "t".into();
+        cfg.last.draft = Draft { project: "p".into(), number: "1".into(), name: "n".into(), changelog: "c".repeat(20_000), file: "f".into() };
+        ensure_ids(&mut cfg);
+        let cp = d.join("config.json");
+        timed("save_to 200 проєктів + чернетка", || save_to(&cp, &cfg).unwrap());
+        timed("save_to повторно (з бекапом)", || save_to(&cp, &cfg).unwrap());
+        timed("load_from", || load_from(&cp));
+        for n in [2000usize, 20000] {
+            let hp = d.join(format!("h{n}.jsonl"));
+            let mut s = String::new();
+            for i in 0..n {
+                s += &format!("{{\"t\":{i},\"project\":\"Проєкт {}\",\"number\":\"1.{i}\",\"platform\":\"Modrinth\",\"ok\":true,\"msg\":\"версія abc https://modrinth.com/project/x/version/abc\"}}\n", i % 50);
+            }
+            std::fs::write(&hp, s).unwrap();
+            let h = timed(&format!("history_load({n} рядків, n=300)"), || history_load_at(&hp, 300));
+            timed(&format!("history_filter 300 ({n})"), || history_filter(&h, "проєкт 7", false).len());
+            timed(&format!("history_csv {n}"), || history_export_at(&hp, &d.join("o.csv")).unwrap());
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_files() {
+        use std::io::Write;
+        let d = tmp_dir("bench_files");
+        let jar = d.join("big.jar");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+        let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        w.start_file("fabric.mod.json", o).unwrap();
+        w.write_all(br#"{"version":"1.0.0","name":"M","depends":{"minecraft":"1.20.1"}}"#).unwrap();
+        let blob = vec![7u8; 1 << 20];
+        for i in 0..80 {
+            w.start_file(format!("assets/blob{i}.bin"), o).unwrap();
+            w.write_all(&blob).unwrap();
+        }
+        for i in 0..5000 {
+            w.start_file(format!("com/x/C{i}.class"), o).unwrap();
+            w.write_all(b"x").unwrap();
+        }
+        w.finish().unwrap();
+        timed("read_jar 80 МБ / 5000 записів", || read_jar(&jar));
+        let mp = d.join("big.mrpack");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&mp).unwrap());
+        w.start_file("modrinth.index.json", o).unwrap();
+        let files: Vec<String> = (0..2000).map(|i| format!("{{\"path\":\"mods/m{i}.jar\",\"hashes\":{{\"sha1\":\"{i:040}\"}}}}")).collect();
+        w.write_all(format!("{{\"versionId\":\"1\",\"name\":\"P\",\"files\":[{}],\"dependencies\":{{\"minecraft\":\"1.20.1\",\"fabric-loader\":\"0.15\"}}}}", files.join(",")).as_bytes()).unwrap();
+        for i in 0..40 {
+            w.start_file(format!("overrides/o{i}.bin"), o).unwrap();
+            w.write_all(&blob).unwrap();
+        }
+        w.finish().unwrap();
+        timed("read_jar mrpack 2000 файлів / 40 МБ", || read_jar(&mp));
+        let big = d.join("big.bin");
+        let mut f = std::fs::File::create(&big).unwrap();
+        for _ in 0..500 {
+            f.write_all(&blob).unwrap();
+            f.write_all(&blob).unwrap();
+        }
+        drop(f);
+        timed("sha512_file 1000 МБ", || sha512_file(&big).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unchecked_tokens_warns_softly() {
+        assert!(unchecked_tokens(true, true, 5, 5).is_none());
+        assert!(unchecked_tokens(false, false, 0, 0).is_none(), "платформа не вибрана");
+        let w = unchecked_tokens(true, true, 0, 9).unwrap();
+        assert!(w.contains("Modrinth") && !w.contains("CurseForge"), "{w}");
+        assert!(unchecked_tokens(true, true, 0, 0).unwrap().contains("Modrinth і CurseForge"));
+    }
+
+    #[test]
+    fn body_read_failure_gets_network_advice() {
+        use std::io::{Read, Write};
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // сервер обіцяє 1000 байт і обриває з'єднання: помилка читання тіла має нести пораду про мережу
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/x", l.local_addr().unwrap());
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut b = [0u8; 1024];
+            let _ = s.read(&mut b);
+            s.write_all(b"HTTP/1.1 200 OK
+Content-Length: 1000
+
+{").unwrap();
+        });
+        let c = client_t(5).unwrap();
+        let e = get_json(&c, &url, ("x", "y")).unwrap_err();
+        h.join().unwrap();
+        assert!(e.contains("Немає зв'язку"), "{e}");
     }
 }
