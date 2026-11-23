@@ -23,11 +23,11 @@ A native desktop app written in Rust ([egui](https://github.com/emilk/egui)). Pi
 
 - **One release, two platforms.** Progress, speed and cancel are tracked per platform. If one platform rejects the file, retry just that one without creating a duplicate on the other.
 - **Autofill from the file.** Version number, name, exact Minecraft versions and loaders (Fabric, Quilt, Forge, NeoForge) are read from `.jar` and `.mrpack` files.
-- **Projects.** Add them from your Modrinth list or by CurseForge ID, pin and sort them, and get icons and names from the APIs.
+- **Projects.** Add them from your Modrinth list or by CurseForge ID, pin them (pinning keeps your manual order of the rest; "Sort by name" is a separate button) and get icons and names from the APIs.
 - **Changelog templates.** Placeholders `{version} {mc} {loaders} {date} {project}`, with a separate template per project.
 - **Checks before upload.** Warnings for a repeated or lower version number and unknown Minecraft versions, plus readable API error messages.
-- **Publish history** with search and a failures-only filter.
-- **Auto-update.** An "update available" banner with an Update button (Windows).
+- **Publish history** with search, a failures-only filter, open / copy link for each published version, and CSV export.
+- **Auto-update.** An "update available" banner with an Update button (Windows). The download is verified (size, SHA-256 from the release when available), the folder must be writable, and if the new build crashes right after start the previous version is restored.
 - **Import and export of projects** without tokens, and a safe config save with a backup copy.
 - **Keyboard friendly.** Ctrl/Cmd+Enter publishes, Ctrl/Cmd+1/2/3 switches sections; screen reader labels are provided.
 
@@ -52,6 +52,7 @@ The app is **not signed or notarized**:
 - **CurseForge Core API key** is optional and only used to fetch a project's name and icon.
 - **Where data is stored.** `<config_dir>/mod-publisher/config.json`. **Tokens are stored as plain text** (on Linux/macOS the file is created with 0o600 permissions). Writes are atomic, the previous config is kept as `config.backup.json`, a schema change creates `config.pre-vN.json`, and unknown fields are preserved. "Clear tokens" removes the tokens together with the copies that contain them.
 - **History:** `history.jsonl` next to the config (it can be cleared inside the app).
+- **Custom data folder.** Set the `MODWIRE_CONFIG_DIR` environment variable to keep the config, history, icons and lock file in another folder (useful for trying the app on empty data without touching your real settings).
 - `.jar` and `.mrpack` files are read in memory only (each metadata entry is capped at 1 MB) and nothing is extracted to disk.
 
 ## Build from source
@@ -81,7 +82,7 @@ cargo clippy --all-targets
 
 The app checks [Releases](https://github.com/Waffylka/ModWire/releases) on startup and on demand (Settings → «Про застосунок» → «Перевірити оновлення»). When a newer version exists, a banner with an Update button appears: the file is downloaded, the app replaces itself and restarts. Automatic replacement works on Windows; on macOS the button opens the release page. Updating is disabled while a publish is running.
 
-Updates are accepted only from `https://github.com/Waffylka/ModWire/releases/download/…`, and the downloaded file is checked for size and the Windows executable signature. There are no signatures or checksums: trust rests on HTTPS and access to this repository. The repository address is the `UPDATE_REPO` constant in `src/logic.rs`.
+Updates are accepted only from `https://github.com/Waffylka/ModWire/releases/download/…`, and the downloaded file is checked for size, SHA-256 and the Windows executable signature. If the release asset carries a SHA-256 digest, the download must match it, otherwise the update is cancelled; the update also needs write access to the folder with `modwire.exe` (it will not work from a protected folder such as Program Files). If the new copy exits with an error within a few seconds, the previous version is put back automatically. There are no code signatures: trust rests on HTTPS and access to this repository. The repository address is the `UPDATE_REPO` constant in `src/logic.rs`.
 
 ## Font
 

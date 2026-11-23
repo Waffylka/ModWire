@@ -258,6 +258,33 @@ pub fn history_filter<'a>(h: &'a [Value], query: &str, only_fail: bool) -> Vec<&
         .collect()
 }
 
+/// Посилання на опубліковану версію з повідомлення успішного запису історії.
+pub fn history_link(e: &Value) -> Option<String> {
+    if e["ok"] != true {
+        return None;
+    }
+    e["msg"].as_str()?.split_whitespace().find(|w| w.starts_with("https://")).map(String::from)
+}
+
+fn csv_cell(s: &str) -> String {
+    // лапки подвоюємо; формули Excel (=,+,-,@) нейтралізуємо апострофом
+    let s = if s.starts_with(['=', '+', '-', '@']) { format!("'{s}") } else { s.to_string() };
+    format!("\"{}\"", s.replace('"', "\"\"").replace(['\r', '\n'], " "))
+}
+
+/// Історія у CSV (від старих до нових): час UTC, проєкт, номер, платформа, результат, повідомлення.
+pub fn history_csv(h: &[Value]) -> String {
+    let mut out = String::from("\u{feff}time_utc,project,number,platform,result,message\r\n");
+    for e in h.iter().rev() {
+        let t = e["t"].as_u64().unwrap_or(0);
+        let (y, m, d) = ymd(t);
+        let when = format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", t % 86400 / 3600, t % 3600 / 60, t % 60);
+        let g = |k: &str| csv_cell(e[k].as_str().unwrap_or(""));
+        out += &format!("{when},{},{},{},{},{}\r\n", g("project"), g("number"), g("platform"), if e["ok"] == true { "ok" } else { "error" }, g("msg"));
+    }
+    out
+}
+
 /// "5 хв тому" для запису з відміткою часу t.
 pub fn ago(t: u64) -> String {
     let d = now_secs().saturating_sub(t);
@@ -635,6 +662,11 @@ pub fn validate(project_ok: bool, any_platform: bool, r: &Release, file: Option<
     let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     if !["jar", "zip", "mrpack"].contains(&ext.as_str()) {
         return Err("Дозволені лише .jar, .zip, .mrpack".into());
+    }
+    match std::fs::metadata(f).map(|m| m.len()) {
+        Ok(0) => return Err("Файл порожній (0 байт)".into()),
+        Ok(n) if n > MAX_FILE => return Err(format!("Файл завеликий ({} МБ): ліміт платформ {} МБ", n >> 20, MAX_FILE >> 20)),
+        _ => {}
     }
     Ok(())
 }
@@ -2013,6 +2045,29 @@ mod tests {
         let e = check_writable(&d.join("немає")).unwrap_err();
         assert!(e.contains("Немає прав на запис"));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn validate_rejects_empty_file() {
+        let p = std::env::temp_dir().join(format!("mp_val_empty_{}.jar", std::process::id()));
+        std::fs::write(&p, b"").unwrap();
+        assert!(validate(true, true, &rel(), Some(&p)).unwrap_err().contains("порожній"));
+        std::fs::write(&p, b"PK").unwrap();
+        assert!(validate(true, true, &rel(), Some(&p)).is_ok());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn history_link_and_csv() {
+        let ok = json!({"t":86400u64,"project":"A, \"x\"","number":"1.0","platform":"Modrinth","ok":true,"msg":"версія 1 https://modrinth.com/project/p/version/1"});
+        let bad = json!({"t":0u64,"project":"=B","number":"2","platform":"CurseForge","ok":false,"msg":"https://x.y помилка\nрядок"});
+        assert_eq!(history_link(&ok).as_deref(), Some("https://modrinth.com/project/p/version/1"));
+        assert_eq!(history_link(&bad), None, "для помилок посилання не пропонуємо");
+        let csv = history_csv(&[ok, bad]); // найновіші першими -> у файлі від старих
+        let lines: Vec<&str> = csv.trim_start_matches('\u{feff}').lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].starts_with("1970-01-01 00:00:00,\"'=B\"") && lines[1].contains("error"));
+        assert!(lines[2].starts_with("1970-01-02 00:00:00,\"A, \"\"x\"\"\""));
     }
 
     #[test]
