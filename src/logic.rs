@@ -89,6 +89,12 @@ pub struct Config {
     pub modrinth_checked: u64,
     pub curse_checked: u64,
     pub core_checked: u64,
+    /// Час (Unix, с) останньої успішної перевірки оновлень: фонова перевірка не частіше UPDATE_EVERY.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub update_checked: u64,
+    /// Версія оновлення, яку користувач пропустив (фонова перевірка її більше не показує).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub update_skip: String,
     pub projects: Vec<Project>,
     pub last: Last,
     #[serde(flatten)]
@@ -96,6 +102,33 @@ pub struct Config {
 }
 
 pub const SCHEMA: u32 = 2;
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Як часто фонова перевірка оновлень ходить у мережу.
+pub const UPDATE_EVERY: u64 = 6 * 3600;
+
+/// Чи пора перевіряти оновлення. Ручна перевірка (manual) завжди дозволена; годинник, що пішов назад, не блокує перевірку.
+pub fn update_due(now: u64, last: u64, manual: bool) -> bool {
+    manual || last > now || now - last >= UPDATE_EVERY
+}
+
+/// Чи показувати знайдене оновлення: фонова перевірка не нагадує про пропущену версію, ручна показує будь-яку.
+pub fn update_visible(version: &str, skipped: &str, manual: bool) -> bool {
+    manual || skipped.trim_start_matches('v') != version.trim_start_matches('v')
+}
+
+/// Прибирає секрети з тексту помилки (сервер може повернути у тілі те, що ми надіслали в заголовку).
+pub fn mask_secrets(text: &str, secrets: &[&str]) -> String {
+    secrets.iter().map(|s| s.trim()).filter(|s| s.len() >= 4).fold(text.to_string(), |t, s| t.replace(s, "•••"))
+}
+
+/// Застосовує `mask_secrets` до помилки результату.
+pub fn masked<T>(r: Result<T, String>, secrets: &[&str]) -> Result<T, String> {
+    r.map_err(|e| mask_secrets(&e, secrets))
+}
 
 /// Присвоює унікальні id проєктам без id або з дублем id.
 pub fn ensure_ids(cfg: &mut Config) {
@@ -332,13 +365,29 @@ pub fn history_add(project: &str, number: &str, platform: &str, res: &Result<Str
     }
 }
 
+fn is_repeat(recent: &[(PathBuf, String, u64)], p: &Path, key: &str, now: u64) -> bool {
+    recent.iter().any(|(pp, k, t)| pp == p && k == key && now.saturating_sub(*t) < 5)
+}
+
 fn history_add_at(p: &Path, project: &str, number: &str, platform: &str, res: &Result<String, String>) {
     use std::io::Write;
     // запис і обрізання під одним замком: два потоки публікації (Modrinth і CurseForge) не гублять рядки
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let msg = match res { Ok(m) | Err(m) => m };
-    let line = json!({"t": now_secs(), "project": project, "number": number, "platform": platform, "ok": res.is_ok(), "msg": msg});
+    // той самий запис упродовж 5 с (подвійна відправка події) не дублюємо
+    static RECENT: std::sync::Mutex<Vec<(PathBuf, String, u64)>> = std::sync::Mutex::new(Vec::new());
+    let key = format!("{project}\u{0}{number}\u{0}{platform}\u{0}{}\u{0}{msg}", res.is_ok());
+    let now = now_secs();
+    {
+        let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        recent.retain(|r| now.saturating_sub(r.2) < 5);
+        if is_repeat(&recent, p, &key, now) {
+            return;
+        }
+        recent.push((p.to_path_buf(), key, now));
+    }
+    let line = json!({"t": now, "project": project, "number": number, "platform": platform, "ok": res.is_ok(), "msg": msg});
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
@@ -511,6 +560,7 @@ pub fn merge_projects(cfg: &mut Config, incoming: Vec<Project>) -> (usize, usize
                 if t.curse_id.is_empty() { t.curse_id = p.curse_id; }
                 if t.icon_url.is_empty() { t.icon_url = p.icon_url; }
                 if t.changelog_template.is_empty() { t.changelog_template = p.changelog_template; }
+                if t.name_template.is_empty() { t.name_template = p.name_template; }
                 merged += 1;
             }
             None => {
@@ -1191,6 +1241,12 @@ fn net_err(e: reqwest::Error) -> String {
     }
 }
 
+/// Прибирає токени з тексту, який покажемо чи запишемо в історію (сервер може ехо-ити заголовки). Токени коротші за 6
+/// символів ігноруються, щоб не псувати звичайний текст. shortcut: лише буквальний збіг (без url-кодування).
+pub fn mask_token(msg: &str, tokens: &[&str]) -> String {
+    tokens.iter().map(|t| t.trim()).filter(|t| t.chars().count() >= 6).fold(msg.to_string(), |m, t| m.replace(t, "***"))
+}
+
 /// Текст помилки з тіла відповіді API (Modrinth: description, CurseForge: errorMessage), інакше обрізане тіло.
 fn api_msg(body: &str) -> String {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
@@ -1230,14 +1286,30 @@ fn mr_get(c: &Client, token: &str, path: &str) -> Result<Value, String> {
     get_json(c, &format!("{}/v2{path}", mr()), ("Authorization", token))
 }
 
-pub fn modrinth_user(token: &str) -> Result<(String, String), String> {
-    parse_user(&mr_get(&client_get()?, token, "/user")?).ok_or_else(|| "немає id користувача".into())
+/// Перевірка токена Modrinth: хто це і чи читає він список проєктів. Без права читання (PROJECT_READ) токен
+/// може лишатися робочим для публікації за ID, тому це попередження, а не помилка.
+pub fn modrinth_token_check(token: &str) -> Result<String, String> {
+    let c = client_get()?;
+    let (id, name) = parse_user(&mr_get(&c, token, "/user")?).ok_or("немає id користувача")?;
+    Ok(match mr_get(&c, token, &format!("/user/{id}/projects")) {
+        Ok(v) => format!("{name}, проєктів: {}", v.as_array().map_or(0, Vec::len)),
+        Err(e) if e.contains("Токен недійсний") || e.contains("Немає доступу") => {
+            format!("{name}. Увага: токен не читає список проєктів (немає права PROJECT_READ). Публікація за ID можлива, якщо є право створення версій (VERSION_CREATE)")
+        }
+        Err(e) => return Err(e),
+    })
+}
+
+/// Перевірка доступу до конкретного проєкту CurseForge через Core API-ключ: проєкт існує і його видно.
+pub fn curse_project_check(key: &str, id: &str) -> Result<String, String> {
+    let (name, _) = curse_mod_info(key, id)?;
+    Ok(format!("проєкт «{name}» знайдено"))
 }
 
 /// Перевірка upload-токена: ендпоінт версій вимагає чинний X-Api-Token.
 pub fn curse_token_check(token: &str) -> Result<String, String> {
     let r = client_get()?.get(format!("{}/api/game/version-types", cf())).header("X-Api-Token", token).send();
-    json_of(r.map_err(net_err)?).map(|_| "токен приймається".to_string())
+    json_of(r.map_err(net_err)?).map(|_| "токен приймається (дійсний для завантаження файлів)".to_string())
 }
 
 /// Перевірка Core API-ключа запитом про гру Minecraft (id 432).
@@ -1629,11 +1701,90 @@ pub fn cleanup_update() {
 fn cleanup_at(exe: &Path) {
     let _ = std::fs::remove_file(exe.with_extension("exe.old"));
     let _ = std::fs::remove_file(exe.with_extension("exe.new"));
+    let _ = std::fs::remove_file(exe.with_extension("exe.bad"));
 }
 
-/// Скільки чекати перед видаленням .old: після оновлення (`--updated`) 30 с, щоб зламану збірку можна було повернути.
-pub fn old_grace(updated: bool) -> Duration {
-    Duration::from_secs(if updated { 30 } else { 0 })
+/// Що робити зі слідами оновлення на старті.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum StartAction {
+    /// Нічого не очікуємо: прибрати .old/.new.
+    Clean,
+    /// Щойно оновлені (`--updated`): .old лишається, доки UI не пропрацює STABLE_SECS; тоді `confirm_update`.
+    AwaitStable,
+    /// Є .old, але попередній запуск після оновлення не дійшов до маркера: запропонувати повернути стару версію.
+    OfferRollback,
+}
+
+/// Скільки секунд живого UI вважаємо доказом, що нова збірка стартує стабільно.
+pub const STABLE_SECS: u64 = 10;
+
+pub fn start_action(updated: bool, old_exists: bool, marker: bool) -> StartAction {
+    match (updated, old_exists, marker) {
+        (true, ..) => StartAction::AwaitStable,
+        (false, true, false) => StartAction::OfferRollback,
+        _ => StartAction::Clean,
+    }
+}
+
+fn marker_path() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("update.ok"))
+}
+
+/// Дія для цього запуску за станом файлів поруч із exe.
+pub fn current_start_action(updated: bool) -> StartAction {
+    let old = std::env::current_exe().is_ok_and(|e| e.with_extension("exe.old").exists());
+    start_action(updated, old, marker_path().is_some_and(|m| m.exists()))
+}
+
+/// Нова збірка пропрацювала стабільно: маркер `update.ok` і прибирання .old.
+pub fn confirm_update() {
+    if let Ok(exe) = std::env::current_exe() {
+        confirm_update_at(&exe);
+    }
+}
+
+fn confirm_update_at(exe: &Path) {
+    if let Some(m) = marker_path() {
+        if let Some(d) = m.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(m, b"ok");
+    }
+    cleanup_at(exe);
+}
+
+/// Перед новою заміною старий маркер не має приховувати проблему.
+fn clear_update_marker() {
+    if let Some(m) = marker_path() {
+        let _ = std::fs::remove_file(m);
+    }
+}
+
+/// Відкат із працюючої (нестабільної) збірки: exe -> .bad, .old -> exe. Windows дозволяє перейменувати запущений файл.
+/// Після Ok треба запустити exe знову й вийти. `.bad` прибере наступний запуск.
+pub fn rollback_running_at(exe: &Path) -> Result<(), String> {
+    let (old, bad) = (exe.with_extension("exe.old"), exe.with_extension("exe.bad"));
+    if !old.exists() {
+        return Err("Немає копії попередньої версії для відкату".into());
+    }
+    let _ = std::fs::remove_file(&bad);
+    std::fs::rename(exe, &bad).map_err(|e| format!("Не вдалося відкласти поточну версію: {e}"))?;
+    if let Err(e) = std::fs::rename(&old, exe) {
+        let _ = std::fs::rename(&bad, exe);
+        return Err(format!("Не вдалося повернути попередню версію: {e}"));
+    }
+    clear_update_marker();
+    Ok(())
+}
+
+pub fn rollback_running() -> Result<(), String> {
+    rollback_running_at(&std::env::current_exe().map_err(|e| e.to_string())?)
+}
+
+/// Запускає exe знову (після відкату); `--updated` змушує нову копію дочекатися звільнення блокування.
+pub fn relaunch() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    std::process::Command::new(exe).arg("--updated").spawn().map(|_| ()).map_err(|e| format!("Не вдалося перезапустити: {e}. Запустіть програму вручну."))
 }
 
 /// Перевіряє завантажений файл: розмір і сигнатура виконуваного файлу Windows («MZ»).
@@ -1731,6 +1882,7 @@ pub fn apply_update(url: &str, size: u64, sha256: &str) -> Result<(), String> {
     if UPDATING.swap(true, Relaxed) {
         return Err("Оновлення вже виконується".into());
     }
+    clear_update_marker();
     let res = download_to(url, &new, size).and_then(|()| install(&exe, &new, &old, sha256));
     UPDATING.store(false, Relaxed);
     res
@@ -1740,6 +1892,10 @@ static UPDATING: AtomicBool = AtomicBool::new(false);
 
 /// Перевіряє завантажений `new` (сума, сигнатура) і підміняє ним `exe`; стара копія лишається як `old`.
 fn install(exe: &Path, new: &Path, old: &Path, sha256: &str) -> Result<(), String> {
+    // файл може тримати антивірус: це не «пошкоджений» і не «не збігається сума»
+    if let Err(e) = std::fs::File::open(new) {
+        return Err(format!("Не вдалося прочитати завантажений файл ({e}): його, імовірно, перевіряє антивірус. Зачекайте хвилину й повторіть"));
+    }
     if !sha256.is_empty() && sha256_file(new).map_or(true, |h| !h.eq_ignore_ascii_case(sha256)) {
         let _ = std::fs::remove_file(new);
         return Err("Контрольна сума завантаженого файлу не збігається з релізом; оновлення скасовано".into());
@@ -2405,6 +2561,117 @@ mod tests {
     }
 
     #[test]
+    fn token_checks_with_mocks() {
+        let user = r#"{"id":"u1","username":"bob"}"#;
+        let (r, _) = with_mock(2, vec![("GET /v2/user/u1/projects", 200, r#"[{"id":"a","title":"A"},{"id":"b","title":"B"}]"#), ("GET /v2/user", 200, user)], || modrinth_token_check("t"));
+        assert_eq!(r.unwrap(), "bob, проєктів: 2");
+        // токен без PROJECT_READ: дійсний, але з попередженням
+        let (r, _) = with_mock(2, vec![("GET /v2/user/u1/projects", 401, "{}"), ("GET /v2/user", 200, user)], || modrinth_token_check("t"));
+        let m = r.unwrap();
+        assert!(m.starts_with("bob.") && m.contains("PROJECT_READ"), "{m}");
+        // недійсний токен: зрозуміле пояснення
+        let (r, _) = with_mock(1, vec![("GET /v2/user", 401, r#"{"description":"Invalid token"}"#)], || modrinth_token_check("t"));
+        assert!(r.unwrap_err().contains("Токен недійсний"));
+        // CurseForge: 401/403 мають пояснення, 200 приймається
+        let (r, _) = with_mock(1, vec![("GET /api/game/version-types", 200, "[]")], || curse_token_check("t"));
+        assert!(r.unwrap().contains("приймається"));
+        let (r, _) = with_mock(1, vec![("GET /api/game/version-types", 403, r#"{"errorMessage":"nope"}"#)], || curse_token_check("t"));
+        assert!(r.unwrap_err().contains("Немає доступу"));
+        let (r, _) = with_mock(1, vec![("GET /v1/mods/7", 200, r#"{"data":{"name":"JEI"}}"#)], || curse_project_check("k", "7"));
+        assert_eq!(r.unwrap(), "проєкт «JEI» знайдено");
+        let (r, _) = with_mock(1, vec![("GET /v1/mods/8", 404, "{}")], || curse_project_check("k", "8"));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn secrets_are_masked_in_errors() {
+        assert_eq!(mask_secrets("bad token mrp_SECRET123 here", &["mrp_SECRET123"]), "bad token ••• here");
+        assert_eq!(mask_secrets("x", &["", "ab"]), "x", "порожні й короткі не чіпаємо");
+        // сервер ехо-повертає токен у повідомленні: після masked його немає
+        let (r, _) = with_mock(1, vec![("GET /v2/user", 400, r#"{"description":"invalid header Authorization: mrp_SECRET123"}"#)], || masked(modrinth_token_check("mrp_SECRET123"), &["mrp_SECRET123"]));
+        let e = r.unwrap_err();
+        assert!(!e.contains("SECRET123") && e.contains("•••"), "{e}");
+    }
+
+    #[test]
+    fn update_throttle_skip_and_prerelease() {
+        let t = 1_000_000;
+        assert!(update_due(t, 0, false) && !update_due(t, t - 60, false) && update_due(t, t - UPDATE_EVERY, false));
+        assert!(update_due(t, t - 60, true), "ручна перевірка не обмежується");
+        assert!(update_due(t, t + 500, false), "годинник пішов назад");
+        assert!(!update_visible("0.4.0", "0.4.0", false) && !update_visible("0.4.0", "v0.4.0", false));
+        assert!(update_visible("0.4.1", "0.4.0", false) && update_visible("0.4.0", "0.4.0", true));
+        let rel = |tag: &str| json!({"tag_name": tag, "draft": false, "prerelease": false, "assets": []});
+        assert!(parse_release(&rel("v99.0.0-rc1"), "o/r", "0.3.0").is_none(), "пробні теги ігноруються");
+        assert!(parse_release(&rel("v99.0.0+build5"), "o/r", "0.3.0").is_some());
+        assert!(parse_release(&rel("v99.0.0"), "o/r", "0.3.0").is_some());
+        assert!(parse_release(&json!({"tag_name":"v99.0.0","prerelease":true}), "o/r", "0.3.0").is_none());
+        // нові поля конфігу порожні = у файл не потрапляють
+        let j = serde_json::to_string(&Config::default()).unwrap();
+        assert!(!j.contains("update_checked") && !j.contains("update_skip"), "{j}");
+    }
+
+    #[test]
+    fn config_forward_backward_compat() {
+        // «нова» програма (0.3) зберігає всі свої поля
+        let mut cfg = Config { schema: SCHEMA, ..Default::default() };
+        (cfg.update_checked, cfg.update_skip) = (123, "0.4.0".into());
+        cfg.projects.push(Project { id: "p1".into(), name: "M".into(), name_template: "{project} {version}".into(), draft: Draft { project: "p1".into(), number: "2".into(), ..Default::default() }, ..Default::default() });
+        cfg.last.draft = Draft { project: "p1".into(), changelog: "c".into(), ..Default::default() };
+        let json = serde_json::to_string(&cfg).unwrap();
+        // «стара» програма (0.2): знає лише базові поля, решту тримає як невідоме (serde flatten) і пише назад
+        #[derive(Serialize, Deserialize, Default)]
+        struct OldProject { name: String, id: String, #[serde(flatten)] extra: serde_json::Map<String, Value> }
+        #[derive(Serialize, Deserialize, Default)]
+        struct OldCfg { schema: u32, projects: Vec<OldProject>, last: serde_json::Map<String, Value>, #[serde(flatten)] extra: serde_json::Map<String, Value> }
+        let old: OldCfg = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.projects[0].name, "M");
+        let back: Config = serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        assert_eq!((back.update_checked, back.update_skip.as_str()), (123, "0.4.0"));
+        assert_eq!(back.projects[0].name_template, "{project} {version}");
+        assert_eq!(back.projects[0].draft.number, "2");
+        assert_eq!(back.last.draft.changelog, "c");
+        // і старий файл (без нових полів) відкривається без втрат
+        let (c, st) = load_from(&{
+            let p = tmp_dir("compat").join("config.json");
+            std::fs::write(&p, r#"{"schema":2,"projects":[{"id":"p1","name":"A","future":1}],"mystery":true}"#).unwrap();
+            p
+        });
+        assert!(matches!(st, Load::Fine) && c.projects[0].extra["future"] == 1 && c.extra["mystery"] == true && c.update_checked == 0);
+    }
+
+    #[test]
+    fn export_import_keeps_name_template_not_draft_or_secrets() {
+        let mut p = Project { id: "p1".into(), name: "M".into(), modrinth_id: "AAA".into(), name_template: "{project} v{version}".into(), draft: Draft { number: "9".into(), changelog: "секрет".into(), ..Default::default() }, ..Default::default() };
+        p.extra.insert("api_token".into(), json!("tok"));
+        p.extra.insert("future".into(), json!(1));
+        let out = export_projects(&[p]);
+        assert!(!out.contains("tok\"") && !out.contains("секрет") && !out.contains("\"draft\""), "{out}");
+        let got = parse_projects_file(&out).unwrap();
+        assert_eq!((got[0].name_template.as_str(), got[0].extra.get("future")), ("{project} v{version}", Some(&json!(1))));
+        // злиття доповнює порожній шаблон, але не затирає наявний
+        let mut cfg = Config { projects: vec![Project { modrinth_id: "AAA".into(), name: "M".into(), ..Default::default() }], ..Default::default() };
+        merge_projects(&mut cfg, got.clone());
+        assert_eq!(cfg.projects[0].name_template, "{project} v{version}");
+        cfg.projects[0].name_template = "мій".into();
+        merge_projects(&mut cfg, got);
+        assert_eq!(cfg.projects[0].name_template, "мій");
+    }
+
+    #[test]
+    fn corrupt_config_with_corrupt_backup_is_saved_aside() {
+        let d = tmp_dir("corrupt2");
+        let p = d.join("config.json");
+        std::fs::write(&p, "{ не json").unwrap();
+        std::fs::write(backup_path(&p), "{ теж не json").unwrap();
+        let (c, st) = load_from(&p);
+        assert!(matches!(st, Load::Recovered) && c.projects.is_empty());
+        let bak = std::fs::read_dir(&d).unwrap().filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().ends_with(".bak"));
+        assert!(bak, "зіпсований файл збережено поруч");
+        assert!(!p.exists() || serde_json::from_str::<Config>(&std::fs::read_to_string(&p).unwrap()).is_ok());
+    }
+
+    #[test]
     fn payloads() {
         let m = modrinth_data(&rel(), "AAA");
         assert_eq!(m["name"], "1.0.0");
@@ -2980,9 +3247,11 @@ mod tests {
         std::fs::write(&new, b"junk").unwrap();
         assert!(install(&exe, &new, &old, "").is_err());
         assert_eq!((std::fs::read(&exe).unwrap(), std::fs::read(&old).unwrap()), (b"v1-good".to_vec(), b"prev".to_vec()));
-        // після --updated .old живе 30 с; у звичайному запуску прибирається одразу
-        assert_eq!(old_grace(true), Duration::from_secs(30));
-        assert!(old_grace(false).is_zero());
+        // після --updated .old лишається, доки UI не пропрацює STABLE_SECS (маркер); звичайний запуск прибирає
+        assert_eq!(start_action(true, true, false), StartAction::AwaitStable);
+        assert_eq!(start_action(false, true, false), StartAction::OfferRollback, ".old без маркера = збій після оновлення");
+        assert_eq!(start_action(false, true, true), StartAction::Clean);
+        assert_eq!(start_action(false, false, false), StartAction::Clean);
         std::fs::write(&new, b"x").unwrap();
         cleanup_at(&exe);
         assert!(!old.exists() && !new.exists() && exe.exists());
@@ -3044,5 +3313,85 @@ mod tests {
         assert!(r.unwrap().contains("BIG"));
         assert_eq!(up.prog.sent.load(Relaxed), 100 << 20);
         eprintln!("100 МБ на моку: {secs:.2} с ({:.0} МБ/с)", 100.0 / secs);
+    }
+
+    #[test]
+    fn rollback_of_running_build_and_confirm_marker() {
+        let _e = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tmp_dir("upd_marker");
+        unsafe { std::env::set_var("MODWIRE_CONFIG_DIR", &d) };
+        let exe = d.join("modwire.exe");
+        let (old, bad) = (exe.with_extension("exe.old"), exe.with_extension("exe.bad"));
+        std::fs::write(&exe, b"v2-unstable").unwrap();
+        std::fs::write(&old, b"v1-good").unwrap();
+        assert!(!marker_path().unwrap().exists());
+        rollback_running_at(&exe).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"v1-good");
+        assert_eq!(std::fs::read(&bad).unwrap(), b"v2-unstable");
+        assert!(!old.exists());
+        assert!(rollback_running_at(&exe).is_err(), "без .old відкату немає");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"v1-good", "помилка не ламає exe");
+        // підтвердження: маркер є, залишки прибрано
+        std::fs::write(&old, b"x").unwrap();
+        confirm_update_at(&exe);
+        assert!(marker_path().unwrap().exists() && !bad.exists() && !old.exists());
+        clear_update_marker();
+        assert!(!marker_path().unwrap().exists());
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    #[test]
+    fn history_repeat_within_5s_is_skipped() {
+        let k = "P\u{0}1.0\u{0}Modrinth\u{0}true\u{0}ok";
+        let p = Path::new("h.jsonl");
+        let prev = [(p.to_path_buf(), "x".to_string(), 99u64), (p.to_path_buf(), k.to_string(), 100u64)];
+        assert!(is_repeat(&prev, p, k, 104));
+        assert!(!is_repeat(&prev, p, k, 105), "через 5 с це вже новий запис");
+        assert!(!is_repeat(&prev, p, "інший", 101));
+        assert!(!is_repeat(&prev, Path::new("other.jsonl"), k, 101));
+        assert!(!is_repeat(&[], p, k, 101));
+        let d = tmp_dir("hist_dedup");
+        let f = d.join("history.jsonl");
+        for _ in 0..3 {
+            history_add_at(&f, "Dup", "1.0", "Modrinth", &Ok("версія X".into()));
+        }
+        history_add_at(&f, "Dup", "1.0", "CurseForge", &Ok("версія X".into()));
+        assert_eq!(std::fs::read_to_string(&f).unwrap().lines().count(), 2, "повтор Modrinth не записано, CurseForge записано");
+    }
+
+    #[test]
+    fn tokens_are_masked_in_messages() {
+        let t = "mrp_SECRETSECRET123";
+        let m = mask_token(&format!("HTTP 401: bad header Authorization: {t} (also {t})"), &[t, "", " short "]);
+        assert!(!m.contains("SECRET") && m.matches("***").count() == 2, "{m}");
+        assert_eq!(mask_token("нічого", &["abc"]), "нічого", "короткі токени не маскуємо");
+        assert_eq!(mask_token("tok123456 x", &["  tok123456\n"]), "*** x", "пробіли з вставки обрізаються");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_files_give_clear_messages_on_windows() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tmp_dir("locked");
+        let (exe, new, old) = (d.join("modwire.exe"), d.join("modwire.exe.new"), d.join("modwire.exe.old"));
+        let mut b = vec![0u8; 1_200_000];
+        b[..2].copy_from_slice(b"MZ");
+        std::fs::write(&exe, b"v1-running").unwrap();
+        // .new тримає антивірус (share_mode(0) = ексклюзивно): зрозуміле повідомлення, а не «пошкоджений»
+        std::fs::write(&new, &b).unwrap();
+        {
+            let _lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&new).unwrap();
+            let e = install(&exe, &new, &old, &"0".repeat(64)).unwrap_err();
+            assert!(e.contains("антивірус") && !e.contains("пошкоджений"), "{e}");
+            assert_eq!(std::fs::read(&exe).unwrap(), b"v1-running");
+        }
+        // .old зайнятий: заміна не починається, exe цілий, повідомлення згадує причину
+        std::fs::write(&old, b"locked-old").unwrap();
+        {
+            let _lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&old).unwrap();
+            let e = install(&exe, &new, &old, "").unwrap_err();
+            assert!(e.contains("Не вдалося замінити програму"), "{e}");
+            assert_eq!(std::fs::read(&exe).unwrap(), b"v1-running");
+        }
     }
 }

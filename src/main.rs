@@ -66,6 +66,7 @@ enum Msg {
     Check(Result<String, String>),
     CheckCf(Result<String, String>),
     CheckKey(Result<String, String>),
+    CheckProj(Result<String, String>), // перевірка проєкту CurseForge через Core API
     CfInfo(String, Option<usize>, Result<(String, String), String>),
     Found(Option<usize>, Result<Box<Project>, String>), // проєкт знайдено за посиланням/slug
     Done(P, Result<String, String>),
@@ -92,6 +93,7 @@ struct App {
     mr_loading: bool,
     mr_msg: String, // помилка завантаження списку Modrinth, показується під кнопкою
     cf_id: String,
+    proj_chk: Chk,                   // результат перевірки проєкту CurseForge
     featured: bool,                  // Modrinth: рекомендована версія
     send_deps: bool,                 // Modrinth: надсилати залежності з файлу
     extra_files: Vec<PathBuf>,       // Modrinth: додаткові файли (до MAX_EXTRA)
@@ -151,6 +153,8 @@ struct App {
     cf_msg: Chk,
     key_msg: Chk,
     open_steps: [bool; 6], // розгорнуті кроки публікації (згортає лише користувач)
+    start_act: StartAction,                    // сліди оновлення на старті
+    stable_at: Option<std::time::Instant>,     // коли нова збірка вважатиметься стабільною
     confirm_close: bool,  // показано діалог «Публікація триває»
     close_ok: bool,       // користувач підтвердив вихід під час публікації
     draft_at: Option<std::time::Instant>, // коли змінилась чернетка форми (запис на диск із затримкою)
@@ -165,7 +169,7 @@ struct App {
 }
 
 /// Стан перевірки токена.
-#[derive(Default, Clone, PartialEq)]
+#[derive(Default, Clone, PartialEq, Debug)]
 enum Chk {
     #[default]
     Idle,
@@ -194,7 +198,7 @@ fn status(ui: &mut egui::Ui, c: &Chk) {
         Chk::Idle => {}
         Chk::Checking => {
             ui.spinner();
-            ui.label(RichText::new("Перевірка…").color(MUTED));
+            ui.label(RichText::new("Перевіряємо…").color(MUTED));
         }
         Chk::Ok(m) | Chk::Err(m) => {
             let ok = matches!(c, Chk::Ok(_));
@@ -680,6 +684,36 @@ fn icon_only(ui: &mut egui::Ui, ic: Ic, tip: &str, on: bool) -> egui::Response {
     if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
 }
 
+/// Прапорець у дусі застосунку: квадрат 20px, увімкнений заливається акцентом із галочкою; клік по всьому рядку.
+fn check_row(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let galley = (!label.is_empty()).then(|| ui.painter().layout(label.to_owned(), egui::TextStyle::Body.resolve(ui.style()), if enabled { TEXT } else { MUTED }, (ui.available_width() - 32.0).max(80.0)));
+    let w = 20.0 + galley.as_ref().map_or(0.0, |g| 10.0 + g.size().x);
+    let h = galley.as_ref().map_or(0.0, |g| g.size().y).max(28.0);
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, *on, label));
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered() && enabled, 0.12);
+    let on_t = ui.ctx().animate_bool_with_time(resp.id.with("on"), *on, 0.12);
+    let bx = egui::Rect::from_center_size(egui::pos2(rect.left() + 10.0, rect.center().y), egui::vec2(20.0, 20.0));
+    let p = ui.painter();
+    let border = UI_BORDER.lerp_to_gamma(ACCENT.gamma_multiply(0.6), t).lerp_to_gamma(ACCENT, on_t);
+    p.rect(bx, 6, FIELD.lerp_to_gamma(ACCENT, on_t), Stroke::new(1.0, if enabled { border } else { BORDER }), egui::StrokeKind::Inside);
+    if on_t > 0.0 {
+        draw_icon(p, bx.center(), Ic::Check, 13.0, ON_ACCENT.gamma_multiply(on_t));
+    }
+    if resp.has_focus() {
+        p.rect_stroke(bx.expand(2.0), 7, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+    }
+    if let Some(g) = galley {
+        p.galley(egui::pos2(rect.left() + 30.0, rect.center().y - g.size().y / 2.0), g, TEXT);
+    }
+    if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
+}
+
 /// Кнопка закриття (X) без рамки.
 fn close_x(ui: &mut egui::Ui) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
@@ -840,7 +874,7 @@ impl App {
         let rt = RELEASE_TYPES.iter().position(|r| *r == l.release_type).unwrap_or(0);
         let mut app = Self {
             tab: Tab::Projects, tx, rx, add_open: false, target: None, mr_list: vec![], mr_loading: false, mr_msg: String::new(),
-            cf_id: String::new(), featured: false, send_deps: false, extra_files: vec![], mr_link: String::new(), sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), sel, file: None,
+            cf_id: String::new(), proj_chk: Chk::Idle, featured: false, send_deps: false, extra_files: vec![], mr_link: String::new(), sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), sel, file: None,
             name: String::new(), number: sel.and_then(|i| cfg.projects.get(i)).map(|p| bump(&p.last_number)).unwrap_or_default(), release_type: rt, changelog: String::new(),
             use_mr: true, use_cf: true, mr_res: None, cf_res: None, pending: 0, msg: String::new(),
             show_tokens: false, confirm_del: None, confirm_clear: false, check_msg: checked_msg(cfg.modrinth_checked), up_mr: Up::default(), up_cf: Up::default(), cur_cl: String::new(), cur_meta: Default::default(),
@@ -851,7 +885,7 @@ impl App {
                 Load::Recovered =>"Конфіг було пошкоджено: копію збережено в теці конфігу (файл .bak), налаштування скинуто.".into(),
                 Load::ReadOnly => "Не вдалося прочитати конфіг: збереження вимкнено, щоб не перезаписати старі дані. Закрийте програми, що тримають файл, і перезапустіть.".into(),
             },
-            readonly: matches!(state, Load::ReadOnly), adding: 0, cf_auto_off: false, cur_idx: None, history: history_load(HIST_MAX), hist_q: String::new(), hist_fail: false, hist_all: false, hist_confirm: false, cur: Default::default(), mc_known: vec![], mc_all: vec![], mc_loading: false, mc_next: None, cf_msg: checked_msg(cfg.curse_checked), key_msg: checked_msg(cfg.core_checked), merge_hidden: false, add_shown: false, file_note: String::new(), splash: splash::Splash::new(), brand_rect: None, file_info: None, focus_step: None, focus_hist: false, proj_q: String::new(), open_steps: [true; 6], confirm_close: false, close_ok: false, draft_at: None, cfg,
+            readonly: matches!(state, Load::ReadOnly), adding: 0, cf_auto_off: false, cur_idx: None, history: history_load(HIST_MAX), hist_q: String::new(), hist_fail: false, hist_all: false, hist_confirm: false, cur: Default::default(), mc_known: vec![], mc_all: vec![], mc_loading: false, mc_next: None, cf_msg: checked_msg(cfg.curse_checked), key_msg: checked_msg(cfg.core_checked), merge_hidden: false, add_shown: false, file_note: String::new(), splash: splash::Splash::new(), brand_rect: None, file_info: None, focus_step: None, focus_hist: false, proj_q: String::new(), open_steps: [true; 6], start_act: START_ACTION.get().copied().unwrap_or(StartAction::Clean), stable_at: None, confirm_close: false, close_ok: false, draft_at: None, cfg,
         };
         app.restore_draft();
         app
@@ -967,7 +1001,7 @@ impl App {
                 if !self.file_note.is_empty() {
                     self.file_note.push(' ');
                 }
-                self.file_note.push_str(&format!("Мод залежить від: {}. Додайте залежності до версії на сайті: програма їх не відправляє.", i.deps.join(", ")));
+                self.file_note.push_str(&format!("Мод залежить від: {}. Додайте залежності до версії на сайті: програма їх не надсилає.", i.deps.join(", ")));
             }
         }
         if let Some(d) = f.parent() {
@@ -989,8 +1023,28 @@ impl App {
         self.notice = "Фонове завдання аварійно завершилось. Спробуйте ще раз; якщо повторюється, повідомте розробників.".into();
     }
 
+    fn mask(&self, e: String) -> String {
+        mask_token(&e, &[&self.cfg.modrinth_token, &self.cfg.curse_token, &self.cfg.curse_core_key])
+    }
+
+    /// Токени не потрапляють у тексти помилок: сервер міг ехо-нути заголовок.
+    fn mask_msg(&self, m: Msg) -> Msg {
+        let f = |r: Result<String, String>| r.map_err(|e| self.mask(e));
+        match m {
+            Msg::Done(p, r) => Msg::Done(p, f(r)),
+            Msg::Check(r) => Msg::Check(f(r)),
+            Msg::CheckCf(r) => Msg::CheckCf(f(r)),
+            Msg::CheckKey(r) => Msg::CheckKey(f(r)),
+            Msg::List(r) => Msg::List(r.map_err(|e| self.mask(e))),
+            Msg::CfInfo(id, t, r) => Msg::CfInfo(id, t, r.map_err(|e| self.mask(e))),
+            Msg::Updated(r) => Msg::Updated(r.map_err(|e| self.mask(e))),
+            other => other,
+        }
+    }
+
     fn poll(&mut self) {
         while let Ok(m) = self.rx.try_recv() {
+            let m = self.mask_msg(m);
             match m {
                 Msg::Panicked => self.on_panic(),
                 Msg::McList(r) => {
@@ -1017,7 +1071,7 @@ impl App {
                 Msg::Check(r) => {
                     if r.is_ok() { self.cfg.modrinth_checked = now_secs(); self.save(); }
                     self.check_msg = match r {
-                        Ok(n) => Chk::Ok(format!("Готово. Користувач: {n}")),
+                        Ok(n) => Chk::Ok(format!("Готово: {n}")),
                         Err(e) => Chk::Err(format!("Помилка: {e}")),
                     }
                 }
@@ -1025,6 +1079,7 @@ impl App {
                     if r.is_ok() { self.cfg.curse_checked = now_secs(); self.save(); }
                     self.cf_msg = r.map_or_else(|e| Chk::Err(format!("Помилка: {e}")), |m| Chk::Ok(format!("Готово: {m}")));
                 }
+                Msg::CheckProj(r) => self.proj_chk = r.map_or_else(|e| Chk::Err(format!("Помилка: {e}")), Chk::Ok),
                 Msg::CheckKey(r) => {
                     if r.is_ok() { self.cfg.core_checked = now_secs(); self.save(); }
                     self.key_msg = r.map_or_else(|e| Chk::Err(format!("Помилка: {e}")), |m| Chk::Ok(format!("Готово: {m}")));
@@ -1071,8 +1126,13 @@ impl App {
                 Msg::Notice(t) => self.notice = t,
                 Msg::Update(r, manual) => {
                     self.upd_checking = false;
+                    if r.is_ok() {
+                        self.cfg.update_checked = now_secs();
+                        self.save();
+                    }
                     match r {
-                        Ok(Some(u)) => self.update = Some(u),
+                        Ok(Some(u)) if update_visible(&u.version, &self.cfg.update_skip, manual) => self.update = Some(u),
+                        Ok(Some(_)) => {} // фонова перевірка: цю версію користувач пропустив
                         Ok(None) if manual => {
                             self.notice = if UPDATE_REPO.contains("OWNER") { "Репозиторій оновлень ще не налаштовано (UPDATE_REPO у logic.rs).".into() } else { format!("У вас остання версія ({}).", env!("CARGO_PKG_VERSION")) };
                         }
@@ -1129,6 +1189,53 @@ impl App {
                     *slot = Some(r);
                 }
             }
+        }
+    }
+
+    /// Після оновлення: через STABLE_SECS живого UI підтверджуємо стабільність (маркер, прибирання .old).
+    /// Якщо минулий запуск після оновлення не дожив до маркера, пропонуємо повернути попередню версію.
+    fn update_guard(&mut self, ctx: &egui::Context) {
+        match self.start_act {
+            StartAction::AwaitStable => {
+                let t = *self.stable_at.get_or_insert_with(std::time::Instant::now);
+                let left = std::time::Duration::from_secs(STABLE_SECS).saturating_sub(t.elapsed());
+                if left.is_zero() {
+                    confirm_update();
+                    self.start_act = StartAction::Clean;
+                } else {
+                    ctx.request_repaint_after(left);
+                }
+            }
+            StartAction::OfferRollback => {
+                let (mut back, mut keep) = (false, false);
+                egui::Modal::new(egui::Id::unique("rollback_dialog")).backdrop_color(Color32::from_black_alpha(160)).frame(modal_frame()).show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.label(title("Нова версія не стартувала стабільно"));
+                    ui.add_space(8.0);
+                    ui.label("Після останнього оновлення програма закрилась раніше, ніж підтвердила нормальну роботу. Повернути попередню версію?");
+                    hint(ui, "Збережена копія попередньої версії лежить поруч із програмою (modwire.exe.old).");
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(primary("Повернути попередню")).clicked() { back = true; }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ghost_btn(ui, None, "Лишити цю").clicked() { keep = true; }
+                        });
+                    });
+                });
+                if back {
+                    match rollback_running().and_then(|()| relaunch()) {
+                        Ok(()) => self.quit = true,
+                        Err(e) => {
+                            self.upd_err = e;
+                            self.start_act = StartAction::Clean;
+                        }
+                    }
+                } else if keep {
+                    confirm_update();
+                    self.start_act = StartAction::Clean;
+                }
+            }
+            StartAction::Clean => {}
         }
     }
 
@@ -1420,29 +1527,38 @@ impl App {
         }
         let Some(u) = self.update.as_ref() else { return };
         let (ver, url, size, sha, page) = (u.version.clone(), u.url.clone(), u.size, u.sha256.clone(), u.page.clone());
-        banner(ui, Kind::Info, &format!("Доступна нова версія {ver} (у вас {}).", env!("CARGO_PKG_VERSION")));
-        ui.horizontal(|ui| {
-            if self.upd_applying {
-                ui.spinner();
-                hint(ui, "Завантажуємо оновлення… Програма перезапуститься сама.");
-            } else if url.is_empty() || !cfg!(windows) {
-                if icon_btn(ui, Some(Ic::External), "Відкрити сторінку релізу", true).clicked() {
-                    ctx.open_url(egui::OpenUrl::new_tab(page));
+        // одна картка: значок і текст, під ними дії; головна дія першою, «Пропустити» останньою
+        egui::Frame::new().fill(FIELD).stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.45))).corner_radius(egui::CornerRadius::same(R_CTRL)).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            icon_label_c(ui, Ic::Info, ACCENT, &format!("Доступна нова версія {ver} (у вас {})", env!("CARGO_PKG_VERSION")), TEXT);
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                if self.upd_applying {
+                    ui.spinner();
+                    hint(ui, "Завантажуємо оновлення… Програма перезапуститься сама.");
+                    return;
+                }
+                if url.is_empty() || !cfg!(windows) {
+                    if icon_btn(ui, Some(Ic::External), "Відкрити сторінку релізу", true).clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(page));
+                    }
+                } else {
+                    let can = self.pending == 0 && self.adding == 0;
+                    if ui.add_enabled(can, primary("Оновити")).on_disabled_hover_text("Дочекайтесь завершення публікації").clicked() {
+                        self.upd_applying = true;
+                        self.upd_err.clear();
+                        self.spawn(ctx, move || Msg::Updated(apply_update(&url, size, &sha).and_then(|()| restart_checked())));
+                    }
                 }
                 if ghost_btn(ui, None, "Пізніше").clicked() {
                     self.update = None;
                 }
-            } else {
-                let can = self.pending == 0 && self.adding == 0;
-                if ui.add_enabled(can, primary("Оновити")).on_disabled_hover_text("Дочекайтесь завершення публікації").clicked() {
-                    self.upd_applying = true;
-                    self.upd_err.clear();
-                    self.spawn(ctx, move || Msg::Updated(apply_update(&url, size, &sha).and_then(|()| restart_checked())));
-                }
-                if ghost_btn(ui, None, "Пізніше").clicked() {
+                if ghost_btn(ui, None, "Пропустити цю версію").on_hover_text("Не нагадувати про неї; нові версії все одно покажуться").clicked() {
+                    self.cfg.update_skip = ver.clone();
                     self.update = None;
+                    self.save();
                 }
-            }
+            });
         });
         ui.add_space(8.0);
     }
@@ -1589,7 +1705,7 @@ impl App {
                                 ui.horizontal(|ui| {
                                     if sel_mode && !p.id.is_empty() {
                                         let mut on = self.picked.contains(&p.id);
-                                        if ui.checkbox(&mut on, "").on_hover_text("Вибрати для видалення").changed() {
+                                        if check_row(ui, &mut on, "").on_hover_text("Вибрати для видалення").changed() {
                                             toggle = Some(p.id.clone());
                                         }
                                     }
@@ -1748,7 +1864,7 @@ impl App {
                         let (t, target) = (self.cfg.modrinth_token.trim().to_string(), self.target);
                         self.adding += 1; // Found зменшує лічильник
                         self.spawn(ctx, move || {
-                            let r = modrinth_lookup(&t, &slug).map(|(id, title, icon)| {
+                            let r = masked(modrinth_lookup(&t, &slug), &[t.as_str()]).map(|(id, title, icon)| {
                                 cache_icon(&icon);
                                 Box::new(Project { name: title, modrinth_id: id, icon_url: icon, ..Default::default() })
                             });
@@ -2242,14 +2358,23 @@ impl App {
                         }
                     }
                 }
+                if has_cf && !self.cfg.curse_core_key.trim().is_empty() {
+                    let id = self.sel.and_then(|i| self.cfg.projects.get(i)).map(|p| p.curse_id.clone()).unwrap_or_default();
+                    if ghost_btn(ui, None, "Перевірити проєкт CurseForge").on_hover_text("Core API-ключ: чи існує проєкт з цим ID і чи його видно").clicked() {
+                        let k = self.cfg.curse_core_key.trim().to_string();
+                        self.proj_chk = Chk::Checking;
+                        self.spawn(ctx, move || Msg::CheckProj(masked(curse_project_check(&k, &id), &[k.as_str()])));
+                    }
+                    status(ui, &self.proj_chk);
+                }
                 if has_mr && self.use_mr {
                     // додаткові можливості лише для Modrinth; усе вимкнено за замовчуванням
                     ui.add_space(8.0);
                     field_label(ui, "Modrinth: додатково");
-                    ui.checkbox(&mut self.featured, "Позначити як рекомендовану");
+                    check_row(ui, &mut self.featured, "Позначити як рекомендовану");
                     let deps = self.file_info.as_ref().map(|i| i.deps.clone()).unwrap_or_default();
                     if !deps.is_empty() {
-                        ui.checkbox(&mut self.send_deps, format!("Надіслати залежності: {}", deps.join(", "))).on_hover_text("Зіставляються з проєктами Modrinth за slug; ненайдені пропускаються. Позначаються як обов'язкові.");
+                        check_row(ui, &mut self.send_deps, &format!("Надіслати залежності: {}", deps.join(", "))).on_hover_text("Зіставляються з проєктами Modrinth за slug; ненайдені пропускаються. Позначаються як обов'язкові.");
                     }
                     let mut rm = None;
                     for (k, p) in self.extra_files.iter().enumerate() {
@@ -2305,12 +2430,21 @@ impl App {
         if !bars.is_empty() || !self.msg.is_empty() || self.mr_res.is_some() || self.cf_res.is_some() {
             let (any_ok, any_err) = (matches!(self.mr_res, Some(Ok(_))) || matches!(self.cf_res, Some(Ok(_))), matches!(self.mr_res, Some(Err(_))) || matches!(self.cf_res, Some(Err(_))));
             let mut new_version = false;
-            egui::ScrollArea::vertical().id_salt("pub_res").max_height((ctx.content_rect().height() * 0.24).clamp(90.0, 220.0)).auto_shrink([false, true]).show(ui, |ui| {
+            if !busy && any_ok {
+                // ряд кнопок над прокруткою: не обрізається в низькій зоні результатів
+                ui.horizontal(|ui| {
+                    new_version = ghost_btn(ui, Some(Ic::Plus), "Нова версія").on_hover_text("Очищає форму для наступної публікації").clicked();
+                    if ghost_btn(ui, Some(Ic::File), "До історії").on_hover_text("Прокрутити до списку публікацій").clicked() {
+                        self.focus_hist = true;
+                    }
+                });
+            }
+            egui::ScrollArea::vertical().id_salt("pub_res").max_height((ctx.content_rect().height() * 0.2).clamp(64.0, 220.0)).auto_shrink([false, true]).show(ui, |ui| {
                 for (name, f, col, extra) in &bars {
                     // підпис над смугою: довжина тексту не зсуває початок смуги, обидві платформи вирівняні
                     // рядок: назва · смуга · відсоток і швидкість (фіксована колонка назви: смуги вирівняні)
                     ui.horizontal(|ui| {
-                        ui.add_sized([90.0, 20.0], egui::Label::new(RichText::new(*name).color(TEXT)));
+                        ui.allocate_ui_with_layout(egui::vec2(90.0, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| ui.label(RichText::new(*name).color(TEXT)));
                         let tail = if ui.available_width() > 420.0 { 170.0 } else { 56.0 };
                         ui.add(egui::ProgressBar::new(*f).desired_height(8.0).desired_width((ui.available_width() - tail - 8.0).max(60.0)).fill(*col).corner_radius(4).animate(false));
                         let txt = if tail > 100.0 { format!("{}%{extra}", (f * 100.0) as u32) } else { format!("{}%", (f * 100.0) as u32) };
@@ -2368,14 +2502,6 @@ impl App {
                 if !busy && any_err {
                     hint(ui, if any_ok { "«Повторити» надішле файл лише туди, де не вдалося: дублів не буде." } else { "Виправте причину й натисніть «Повторити»: введені дані збережено." });
                 }
-                if !busy && any_ok {
-                    ui.horizontal(|ui| {
-                        new_version = ghost_btn(ui, Some(Ic::Plus), "Нова версія").on_hover_text("Очищає форму для наступної публікації").clicked();
-                        if ghost_btn(ui, Some(Ic::File), "До історії").on_hover_text("Прокрутити до списку публікацій").clicked() {
-                            self.focus_hist = true;
-                        }
-                    });
-                }
             });
             if new_version {
                 (self.number, self.name, self.changelog, self.file) = Default::default();
@@ -2395,7 +2521,7 @@ impl App {
         let mk = || primary(&label).min_size(egui::vec2(if narrow { 150.0 } else { 220.0 }, if narrow { 38.0 } else { 44.0 }));
         // у вузькому вікні — один рядок (підсумок і кнопка); два рядки лише під час публікації, де є кнопки «Скасувати»
         if narrow && busy {
-            ui.horizontal(|ui| self.bar_summary(ui, busy, &ready, mr, cf));
+            ui.horizontal_wrapped(|ui| self.bar_summary(ui, busy, &ready, mr, cf));
             ui.add_space(8.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_enabled(can, mk()).on_disabled_hover_text(why).clicked() {
@@ -2421,10 +2547,12 @@ impl App {
             let running: Vec<(&str, &Up)> = [("Modrinth", &self.up_mr), ("CurseForge", &self.up_cf)].into_iter().filter(|(_, u)| u.active.load(Relaxed)).collect();
             ui.label(if running.iter().all(|(_, u)| u.cancel.load(Relaxed)) { "Скасування…" } else { "Надсилаємо файл, зачекайте…" });
             let many = running.len() > 1;
+            let tight = ui.available_width() < 560.0; // вузьке вікно: лише назва платформи, повний текст у підказці
             for (n, u) in running {
                 let cancelling = u.cancel.load(Relaxed);
-                let label = if many { format!("Скасувати {n}") } else { "Скасувати".to_string() };
-                if ui.add_enabled_ui(!cancelling, |ui| ghost_btn(ui, Some(Ic::Cross), &label)).inner.clicked() {
+                let full = if many { format!("Скасувати {n}") } else { "Скасувати".to_string() };
+                let label = if many && tight { n.to_string() } else { full.clone() };
+                if ui.add_enabled_ui(!cancelling, |ui| ghost_btn(ui, Some(Ic::Cross), &label)).inner.on_hover_text(full).clicked() {
                     u.cancel.store(true, Relaxed);
                 }
             }
@@ -2440,11 +2568,15 @@ impl App {
                     let (mr, cf) = if mr_left || cf_left { (mr_left, cf_left) } else { (mr, cf) };
                     let to = match (mr, cf) { (true, true) => "Modrinth і CurseForge", (true, false) => "Modrinth", _ => "CurseForge" };
                     let txt = p.map_or_else(String::new, |p| format!("{} {} → {}", p.name, self.number.trim(), to));
-                    icon_label_c(ui, Ic::Check, SUCCESS, &txt, SUCCESS);
-                    if let Some(p) = p {
-                        let full = release_summary(&p.name, &self.release(), mr0, cf0);
-                        ui.add(egui::Label::new(RichText::new(&full).color(MUTED).size(HINT_SZ)).truncate()).on_hover_text(full);
-                    }
+                    // два рядки один під одним: у вузькому вікні текст не обрізається збоку від кнопки
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        icon_label_c(ui, Ic::Check, SUCCESS, &txt, SUCCESS);
+                        if let Some(p) = p {
+                            let full = release_summary(&p.name, &self.release(), mr0, cf0);
+                            if ui.ctx().content_rect().height() >= 600.0 { ui.add(egui::Label::new(RichText::new(&full).color(MUTED).size(HINT_SZ)).truncate()).on_hover_text(full); }
+                        }
+                    });
                 }
                 Err(e) => {
                     ui.label(RichText::new(format!("Крок {cur} з 6")).color(MUTED).size(HINT_SZ));
@@ -2613,8 +2745,8 @@ impl App {
             self.spawn(ctx, move || {
                 // паніка в потоці не має лишати інтерфейс у «Публікація…»
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match plat {
-                    P::Mr => publish_modrinth(token.trim(), &id, &rel, &file, &up),
-                    P::Cf => publish_curse(token.trim(), &core_key, &id, &rel, &file, &up),
+                    P::Mr => masked(publish_modrinth(token.trim(), &id, &rel, &file, &up), &[token.as_str()]),
+                    P::Cf => masked(publish_curse(token.trim(), &core_key, &id, &rel, &file, &up), &[token.as_str(), core_key.as_str()]),
                 }))
                 .unwrap_or_else(|_| Err("Внутрішня помилка під час публікації: перевірте на сайті, чи не з'явилась версія".into()));
                 up.active.store(false, Relaxed);
@@ -2626,7 +2758,7 @@ impl App {
     // ---------- Налаштування ----------
     fn settings_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("Налаштування");
-        hint(ui, "Токени зберігаються на цьому комп'ютері. Зміни зберігаються автоматично.");
+        hint(ui, "Потрібен токен платформи, на яку публікуєте. Токени лишаються на цьому комп'ютері, зміни зберігаються самі.");
         ui.add_space(12.0);
         let mut changed = false;
         // Modrinth | CurseForge (upload-токен і Core API-ключ в одній плитці), нижче безпека.
@@ -2672,7 +2804,7 @@ impl App {
                             self.check_msg = Chk::Err("Спершу вставте токен".into());
                         } else {
                             self.check_msg = Chk::Checking;
-                            self.spawn(ctx, move || Msg::Check(modrinth_user(&t).map(|u| u.1)));
+                            self.spawn(ctx, move || Msg::Check(masked(modrinth_token_check(&t), &[t.as_str()])));
                         }
                     }
                     status(ui, &self.check_msg);
@@ -2700,7 +2832,7 @@ impl App {
                             self.cf_msg = Chk::Err("Спершу вставте токен".into());
                         } else {
                             self.cf_msg = Chk::Checking;
-                            self.spawn(ctx, move || Msg::CheckCf(curse_token_check(&t)));
+                            self.spawn(ctx, move || Msg::CheckCf(masked(curse_token_check(&t), &[t.as_str()])));
                         }
                     }
                     status(ui, &self.cf_msg);
@@ -2726,7 +2858,7 @@ impl App {
                             self.key_msg = Chk::Err("Спершу вставте ключ".into());
                         } else {
                             self.key_msg = Chk::Checking;
-                            self.spawn(ctx, move || Msg::CheckKey(curse_key_check(&k)));
+                            self.spawn(ctx, move || Msg::CheckKey(masked(curse_key_check(&k), &[k.as_str()])));
                         }
                     }
                     status(ui, &self.key_msg);
@@ -2959,7 +3091,10 @@ impl eframe::App for App {
         }
         if !self.upd_started {
             self.upd_started = true;
-            self.spawn(ctx, || Msg::Update(check_update(), false));
+            // не частіше за UPDATE_EVERY (6 годин); ручна кнопка в налаштуваннях працює завжди
+            if update_due(now_secs(), self.cfg.update_checked, false) {
+                self.spawn(ctx, || Msg::Update(check_update(), false));
+            }
         }
         if !self.centered {
             // 60% монітора, але не менше мінімуму; центр = (монітор − вікно) / 2. Чекаємо, поки egui знає монітор.
@@ -3047,6 +3182,7 @@ impl eframe::App for App {
         }
         self.merge_dialog(ctx);
         self.close_dialog(ctx);
+        self.update_guard(ctx);
         self.splash.show(ctx, self.brand_rect);
     }
 
@@ -3062,6 +3198,9 @@ fn app_icon() -> Option<egui::IconData> {
     let (width, height) = img.dimensions();
     Some(egui::IconData { rgba: img.into_raw(), width, height })
 }
+
+/// Що робити зі слідами оновлення (визначає main до створення App).
+static START_ACTION: std::sync::OnceLock<StartAction> = std::sync::OnceLock::new();
 
 fn main() -> eframe::Result {
     // Err (немає прав на теку тощо): стартуємо без блокування, щоб не заважати роботі
@@ -3084,15 +3223,13 @@ fn main() -> eframe::Result {
         other => other.ok().flatten(),
     };
     // лише під блокуванням: друга копія не має стерти .new, який хтось завантажує.
-    // Після оновлення .old лишається ще 30 с: якщо нова копія не стартує, його можна повернути вручну.
-    if std::env::args().any(|a| a == "--updated") {
-        std::thread::spawn(|| {
-            std::thread::sleep(old_grace(true));
-            cleanup_update();
-        });
-    } else {
+    // Після оновлення .old лишається, доки UI не пропрацює STABLE_SECS (тоді маркер update.ok);
+    // якщо .old є без маркера, на старті пропонуємо повернути попередню версію.
+    let act = current_start_action(std::env::args().any(|a| a == "--updated"));
+    if act == StartAction::Clean {
         cleanup_update();
     }
+    let _ = START_ACTION.set(act);
     let mut vb = egui::ViewportBuilder::default().with_inner_size([900.0, 580.0]).with_min_inner_size([760.0, 480.0]);
     if let Some(i) = app_icon() {
         vb = vb.with_icon(i);
@@ -3113,7 +3250,7 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_msg, guarded, guarded_opt, must_ask_close, speed_text, split_url, App, Chk, Msg, Project};
+    use super::{checked_msg, guarded, guarded_opt, must_ask_close, speed_text, split_url, App, Chk, Msg, Project, P};
 
     #[test]
     fn split_url_separates_link() {
@@ -3196,6 +3333,36 @@ mod tests {
         assert_eq!((app.number.as_str(), app.changelog.as_str()), ("9.9", "чернетка"));
         app.select_project(Some(0)); // повторний вибір нічого не міняє
         assert_eq!(app.number, "9.9");
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    #[test]
+    fn panic_message_resets_busy_flags() {
+        let (_g, mut app) = test_app("panic");
+        (app.mc_loading, app.mr_loading, app.upd_checking, app.upd_applying, app.refreshing, app.adding) = (true, true, true, true, true, 3);
+        (app.check_msg, app.cf_msg) = (Chk::Checking, Chk::Checking);
+        app.key_msg = Chk::Ok("було".into());
+        app.tx.send(Msg::Panicked).unwrap();
+        app.poll();
+        assert!(!(app.mc_loading || app.mr_loading || app.upd_checking || app.upd_applying || app.refreshing) && app.adding == 0);
+        assert!(matches!(app.check_msg, Chk::Err(_)) && matches!(app.cf_msg, Chk::Err(_)), "«Перевіряємо…» не залипає");
+        assert!(matches!(app.key_msg, Chk::Ok(_)), "завершений статус не чіпаємо");
+        assert!(app.mc_next.is_some() && !app.notice.is_empty());
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    #[test]
+    fn tokens_never_reach_ui_or_history_messages() {
+        let (_g, mut app) = test_app("mask");
+        app.cfg.modrinth_token = " mrp_TOPSECRET_12345 ".into();
+        app.cfg.curse_core_key = "core-KEY-abcdef".into();
+        app.tx.send(Msg::Check(Err("bad: mrp_TOPSECRET_12345".into()))).unwrap();
+        app.tx.send(Msg::CheckKey(Err("echo core-KEY-abcdef".into()))).unwrap();
+        app.tx.send(Msg::Done(P::Mr, Err("401 Authorization: mrp_TOPSECRET_12345".into()))).unwrap();
+        app.poll();
+        let shown = format!("{:?}{:?}", app.check_msg, app.key_msg);
+        assert!(!shown.contains("TOPSECRET") && !shown.contains("abcdef"), "{shown}");
+        assert!(matches!(&app.mr_res, Some(Err(e)) if !e.contains("TOPSECRET") && e.contains("***")));
         unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
     }
 }

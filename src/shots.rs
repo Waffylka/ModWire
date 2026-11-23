@@ -41,6 +41,9 @@ const SCENES: &[(&str, f32, f32)] = &[
     ("add_dialog", 900.0, 580.0), ("add_dialog", 760.0, 480.0),
     ("merge", 900.0, 580.0), ("merge", 760.0, 480.0),
     ("empty", 900.0, 580.0), ("empty", 760.0, 480.0),
+    ("settings_update", 900.0, 580.0), ("settings_updating", 900.0, 580.0), ("settings_updateerr", 900.0, 580.0),
+    ("publish_busy", 900.0, 580.0), ("publish_busy", 760.0, 480.0),
+    ("close_dialog", 900.0, 580.0),
     ("icons", 900.0, 520.0),
 ];
 
@@ -66,6 +69,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
     app.cfg.curse_token.clear();
     (app.mr_res, app.cf_res, app.msg) = (None, None, String::new());
     app.notice.clear();
+    (app.update, app.upd_applying, app.upd_err, app.pending, app.confirm_close, app.featured) = (None, false, String::new(), 0, false, false);
     match name {
         "projects" | "projects_tall" => app.tab = Tab::Projects,
         "projects_confirm" => {
@@ -77,7 +81,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
             app.merge_hidden = false;
             app.merge_ask = vec![(0, super::Project { name: "Aurora Lights".into(), curse_id: "999".into(), ..Default::default() })];
         }
-        "publish" | "publish_tall" | "publish_done" => {
+        "publish" | "publish_tall" | "publish_done" | "publish_busy" | "close_dialog" => {
             app.cfg.modrinth_token = "fixture".into();
             app.cfg.curse_token = "fixture".into();
             app.tab = Tab::Publish;
@@ -90,6 +94,19 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
                 app.changelog = "- Нові ефекти світла\n- Виправлено вильоти при завантаженні світу".into();
                 app.cfg.last.mc_versions = "1.20.1, 1.20.4".into();
                 app.cfg.last.loaders = vec!["fabric".into(), "forge".into()];
+            }
+            app.featured = name == "publish_tall";
+            if name == "publish_busy" || name == "close_dialog" {
+                use std::sync::atomic::Ordering::Relaxed;
+                app.pending = 2;
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+                for (up, sent) in [(&app.up_mr, 62_000_000u64), (&app.up_cf, 18_000_000u64)] {
+                    up.active.store(true, Relaxed);
+                    up.prog.total.store(100_000_000, Relaxed);
+                    up.prog.sent.store(sent, Relaxed);
+                    up.prog.started_ms.store(now.saturating_sub(8_000), Relaxed);
+                }
+                app.confirm_close = name == "close_dialog";
             }
             if name == "publish_done" {
                 app.mr_res = Some(Ok("Версію створено https://modrinth.com/mod/aurora/version/1".into()));
@@ -104,9 +121,16 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
                 ];
             }
         }
-        "settings" | "settings_tall" => {
+        "settings" | "settings_tall" | "settings_update" | "settings_updating" | "settings_updateerr" => {
             app.cfg.modrinth_token = "fixture".into();
             app.tab = Tab::Settings;
+            if name.starts_with("settings_update") {
+                app.update = Some(super::Update { version: "0.4.0".into(), url: "https://example.invalid/modwire.exe".into(), size: 0, sha256: String::new(), page: "https://example.invalid/release".into() });
+                app.upd_applying = name == "settings_updating";
+                if name == "settings_updateerr" {
+                    app.upd_err = "Не вдалося встановити оновлення: немає прав на запис у теку програми.".into();
+                }
+            }
         }
         "add_dialog" => {
             app.tab = Tab::Projects;
