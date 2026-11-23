@@ -28,6 +28,12 @@ pub struct Project {
     /// Стабільний ідентифікатор запису (не індекс): присвоюється міграцією і при збереженні.
     pub id: String,
     pub pinned: bool,
+    /// Шаблон назви версії ({project} {version} {mc} {loaders} {date}); порожній = назва за номером.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name_template: String,
+    /// Незавершена форма цього проєкту, коли користувач перемкнувся на інший.
+    #[serde(skip_serializing_if = "Draft::is_empty")]
+    pub draft: Draft,
     /// Невідомі поля зберігаються при перезаписі (сумісність із новішими версіями).
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -117,6 +123,80 @@ pub fn pin_perm(ps: &[Project]) -> Vec<usize> {
     v
 }
 
+/// Індекси проєктів, що підходять під пошук (назва або ID платформ, без регістру); порожній запит = усі.
+pub fn filter_projects(ps: &[Project], q: &str) -> Vec<usize> {
+    let q = q.trim().to_lowercase();
+    (0..ps.len()).filter(|&i| q.is_empty() || [&ps[i].name, &ps[i].modrinth_id, &ps[i].curse_id].iter().any(|f| f.to_lowercase().contains(&q))).collect()
+}
+
+/// Копія проєкту в кінець списку (з новим id, назвою «… (копія)», без закріплення). Повертає індекс копії.
+pub fn duplicate_project(cfg: &mut Config, i: usize) -> Option<usize> {
+    let mut p = cfg.projects.get(i)?.clone();
+    let base = format!("{} (копія", p.name.trim());
+    let mut name = format!("{base})");
+    let mut n = 2;
+    while cfg.projects.iter().any(|q| q.name == name) {
+        name = format!("{base} {n})");
+        n += 1;
+    }
+    (p.name, p.id, p.pinned, p.draft) = (name, String::new(), false, Draft::default());
+    cfg.projects.push(p);
+    ensure_ids(cfg);
+    Some(cfg.projects.len() - 1)
+}
+
+/// Посилання на сторінку проєкту, вставлене користувачем.
+#[derive(Debug, PartialEq)]
+pub enum Link {
+    Modrinth(String),
+    CurseSlug(String),
+    CurseId(String),
+}
+
+/// Розпізнає посилання modrinth.com/<тип>/<slug> та curseforge.com/minecraft/<розділ>/<slug> (або /projects/<id>).
+/// Хост перевіряється точно (modrinth.com.evil.org не проходить); без схеми теж працює.
+pub fn parse_project_link(s: &str) -> Option<Link> {
+    let s = s.trim();
+    let s = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).unwrap_or(s);
+    let (host, path) = s.split_once('/')?;
+    let host = host.to_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let segs: Vec<&str> = path.split(['?', '#']).next().unwrap_or("").split('/').filter(|p| !p.is_empty()).collect();
+    let slug = |x: &&str| (!x.is_empty() && x.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))).then(|| x.to_string());
+    match (host, segs.as_slice()) {
+        ("modrinth.com", ["mod" | "plugin" | "modpack" | "resourcepack" | "shader" | "datapack" | "project", x, ..]) => slug(x).map(Link::Modrinth),
+        ("curseforge.com", ["minecraft", "mc-mods" | "modpacks" | "texture-packs" | "shaders" | "data-packs", x, ..]) => slug(x).map(Link::CurseSlug),
+        ("curseforge.com", ["projects", x, ..]) if !x.is_empty() && x.chars().all(|c| c.is_ascii_digit()) => Some(Link::CurseId(x.to_string())),
+        _ => None,
+    }
+}
+
+/// Slug для пошуку на Modrinth: з посилання modrinth.com або голе слово (slug/id); інше (чужі посилання, пробіли) = None.
+pub fn modrinth_slug_input(s: &str) -> Option<String> {
+    match parse_project_link(s) {
+        Some(Link::Modrinth(x)) => Some(x),
+        Some(_) => None,
+        None => {
+            let t = s.trim();
+            (!t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))).then(|| t.to_string())
+        }
+    }
+}
+
+/// (id, назва, іконка) проєкту Modrinth за slug або id; токен не обов'язковий (публічні проєкти).
+pub fn modrinth_lookup(token: &str, slug: &str) -> Result<(String, String, String), String> {
+    let v = mr_get(&client_t(20)?, token, &format!("/project/{slug}")).map_err(|e| if e.contains("404") { format!("Проєкт «{slug}» не знайдено на Modrinth") } else { e })?;
+    Ok((v["id"].as_str().ok_or("немає id проєкту")?.into(), v["title"].as_str().ok_or("немає назви проєкту")?.into(), v["icon_url"].as_str().unwrap_or("").into()))
+}
+
+/// (id, назва, іконка) проєкту CurseForge за slug через Core API (потрібен ключ).
+pub fn curse_lookup_slug(key: &str, slug: &str) -> Result<(String, String, String), String> {
+    let v = get_json(&client_t(20)?, &format!("{}/v1/mods/search?gameId=432&slug={slug}", core()), ("x-api-key", key))?;
+    let d = v["data"].as_array().and_then(|a| a.first()).ok_or_else(|| format!("Проєкт «{slug}» не знайдено на CurseForge"))?;
+    let (name, icon) = parse_curse_mod(&json!({ "data": d })).ok_or("немає назви проєкту")?;
+    Ok((d["id"].as_u64().ok_or("немає id проєкту")?.to_string(), name, icon))
+}
+
 /// Для export: прибирає зайві поля, схожі на секрети.
 fn strip_secrets(p: &Project) -> Project {
     fn secret(k: &str) -> bool {
@@ -135,6 +215,7 @@ fn strip_secrets(p: &Project) -> Project {
         }
     }
     let mut q = p.clone();
+    q.draft = Draft::default(); // чернетка змін не є налаштуванням і не йде в експорт
     q.extra.retain(|k, _| !secret(k));
     q.extra.values_mut().for_each(scrub);
     q
@@ -247,6 +328,9 @@ pub fn history_add(project: &str, number: &str, platform: &str, res: &Result<Str
 
 fn history_add_at(p: &Path, project: &str, number: &str, platform: &str, res: &Result<String, String>) {
     use std::io::Write;
+    // запис і обрізання під одним замком: два потоки публікації (Modrinth і CurseForge) не гублять рядки
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let msg = match res { Ok(m) | Err(m) => m };
     let line = json!({"t": now_secs(), "project": project, "number": number, "platform": platform, "ok": res.is_ok(), "msg": msg});
     if let Some(d) = p.parent() {
@@ -509,6 +593,45 @@ pub struct JarInfo {
     pub loaders: Vec<&'static str>,
     /// Лише точно задані версії MC (діапазони на кшталт ">=1.20" не вгадуються).
     pub mc_versions: Vec<String>,
+    /// Обов'язкові залежності-моди (без Minecraft і самого лоадера): лише для інформування автора.
+    pub deps: Vec<String>,
+}
+
+/// Id мода-залежності без службових (minecraft, java, лоадери).
+fn push_dep(out: &mut Vec<String>, id: &str) {
+    let id = id.trim();
+    let skip = ["minecraft", "java", "fabricloader", "fabric-loader", "quilt_loader", "quilt-loader", "forge", "neoforge", "fml", "javafml", "mixinextras"];
+    if !id.is_empty() && !skip.contains(&id) && !out.iter().any(|o| o == id) {
+        out.push(id.to_string());
+    }
+}
+
+/// Обов'язкові залежності з [[dependencies.*]] mods.toml (mandatory=true або type="required").
+pub fn toml_deps(t: &str) -> Vec<String> {
+    let mut out = vec![];
+    let (mut in_dep, mut id, mut req) = (false, String::new(), false);
+    let val = |l: &str, k: &str| {
+        let r = l.strip_prefix(k)?.trim_start().strip_prefix('=')?;
+        Some(r.split('#').next().unwrap_or("").trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+    };
+    for l in t.lines().map(str::trim) {
+        if l.starts_with('[') {
+            if in_dep && req {
+                push_dep(&mut out, &id);
+            }
+            (in_dep, id, req) = (l.starts_with("[[dependencies."), String::new(), false);
+        } else if let Some(v) = val(l, "modId") {
+            id = v;
+        } else if let Some(v) = val(l, "mandatory") {
+            req = v == "true";
+        } else if let Some(v) = val(l, "type") {
+            req = v == "required";
+        }
+    }
+    if in_dep && req {
+        push_dep(&mut out, &id);
+    }
+    out
 }
 
 /// "1.20.1", "[1.20.1]" або "=1.20.1" → точна версія MC; діапазони й маски → None.
@@ -622,17 +745,26 @@ pub fn read_jar(path: &Path) -> Option<JarInfo> {
             Value::Array(a) => a.iter().for_each(|s| push_mc(&mut info.mc_versions, s.as_str().and_then(mc_exact))),
             _ => {}
         }
+        if let Some(m) = v["depends"].as_object() {
+            m.keys().for_each(|k| push_dep(&mut info.deps, k));
+        }
     }
     if let Some(t) = jar_entry(&mut z, "quilt.mod.json") {
         info.loaders.push("quilt");
         let v: Value = serde_json::from_str(&t).unwrap_or_default();
         info.version = info.version.or(real(v["quilt_loader"]["version"].as_str()));
         info.name = info.name.or(real(v["quilt_loader"]["metadata"]["name"].as_str()));
+        for d in v["quilt_loader"]["depends"].as_array().into_iter().flatten() {
+            if let Some(id) = d.as_str().or(d["id"].as_str()) {
+                push_dep(&mut info.deps, id);
+            }
+        }
     }
     for (entry, loader) in [("META-INF/neoforge.mods.toml", "neoforge"), ("META-INF/mods.toml", "forge")] {
         if let Some(t) = jar_entry(&mut z, entry) {
             info.loaders.push(loader);
             info.version = info.version.or(toml_version(&t));
+            toml_deps(&t).iter().for_each(|d| push_dep(&mut info.deps, d));
             toml_mc(&t).into_iter().for_each(|v| push_mc(&mut info.mc_versions, Some(v)));
         }
     }
@@ -949,8 +1081,24 @@ fn client_get() -> Result<Client, String> {
     client_t(30)
 }
 
+/// Клієнт для запитів із токенами: редирект лише в межах того самого хоста й без пониження https, інакше
+/// заголовки X-Api-Token / x-api-key (reqwest знімає лише Authorization) пішли б на чужий сервер.
 fn client_t(secs: u64) -> Result<Client, String> {
+    client_with(secs, reqwest::redirect::Policy::custom(|a| {
+        let prev = a.previous().last();
+        let ok = a.previous().len() < 5 && prev.is_some_and(|p| p.host_str() == a.url().host_str() && p.port_or_known_default() == a.url().port_or_known_default() && !(p.scheme() == "https" && a.url().scheme() != "https"));
+        if ok { a.follow() } else { a.stop() }
+    }))
+}
+
+/// Клієнт без токенів (іконки, GitHub, завантаження оновлення): звичайні редиректи, напр. на CDN.
+fn client_open(secs: u64) -> Result<Client, String> {
+    client_with(secs, reqwest::redirect::Policy::limited(5))
+}
+
+fn client_with(secs: u64, redirect: reqwest::redirect::Policy) -> Result<Client, String> {
     Client::builder()
+        .redirect(redirect)
         .timeout(Duration::from_secs(secs))
         .connect_timeout(Duration::from_secs(15))
         .user_agent(concat!("mod-publisher/", env!("CARGO_PKG_VERSION")))
@@ -1095,7 +1243,7 @@ pub fn cache_icon(url: &str) {
     }
     let _ = (|| -> Result<(), String> {
         use std::io::Read;
-        let r = client_get()?.get(url).send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
+        let r = client_open(30)?.get(url).send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
         r.take(ICON_MAX + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
         if bytes.len() as u64 > ICON_MAX {
@@ -1326,7 +1474,7 @@ fn check_repo(repo: &str) -> Result<Option<Update>, String> {
     if repo.contains("OWNER") {
         return Ok(None);
     }
-    let c = client_t(20)?;
+    let c = client_open(20)?;
     let v = get_json(&c, &format!("https://api.github.com/repos/{repo}/releases/latest"), ("accept", "application/vnd.github+json"))?;
     Ok(parse_release(&v, repo, env!("CARGO_PKG_VERSION")))
 }
@@ -1396,7 +1544,7 @@ pub fn restart_checked() -> Result<(), String> {
 
 fn download_to(url: &str, dest: &Path, size: u64) -> Result<(), String> {
     use std::io::{Read, Write};
-    let c = client_t(900)?;
+    let c = client_open(900)?;
     let resp = c.get(url).send().map_err(net_err)?;
     if !resp.status().is_success() {
         return Err(format!("Сервер відповів {}", resp.status()));
@@ -1577,6 +1725,81 @@ mod tests {
         assert!(matches!(st, Load::Restored) || matches!(st, Load::Recovered));
         let _ = c2;
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn project_links_parse() {
+        use Link::*;
+        assert_eq!(parse_project_link("https://modrinth.com/mod/sodium"), Some(Modrinth("sodium".into())));
+        assert_eq!(parse_project_link(" modrinth.com/modpack/Fabulously-Optimized/versions?x=1#a "), Some(Modrinth("Fabulously-Optimized".into())));
+        assert_eq!(parse_project_link("https://www.modrinth.com/plugin/x_y.z"), Some(Modrinth("x_y.z".into())));
+        assert_eq!(parse_project_link("https://www.curseforge.com/minecraft/mc-mods/jei/files"), Some(CurseSlug("jei".into())));
+        assert_eq!(parse_project_link("https://www.curseforge.com/projects/238222"), Some(CurseId("238222".into())));
+        assert_eq!(modrinth_slug_input("sodium").as_deref(), Some("sodium"));
+        assert_eq!(modrinth_slug_input("https://modrinth.com/mod/sodium").as_deref(), Some("sodium"));
+        assert_eq!(modrinth_slug_input("https://curseforge.com/projects/5"), None);
+        assert_eq!(modrinth_slug_input("a/b"), None);
+        for bad in ["sodium", "123456", "https://modrinth.com.evil.org/mod/x", "https://evil.org/modrinth.com/mod/x", "https://modrinth.com/mod/", "https://modrinth.com/user/x", "https://curseforge.com/projects/abc", "https://modrinth.com/mod/a b"] {
+            assert_eq!(parse_project_link(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn lookup_by_slug_with_mocks() {
+        let (r, seen) = with_mock(1, vec![("GET /v2/project/sodium", 200, r#"{"id":"AANobbMI","title":"Sodium","icon_url":"https://i/x.png"}"#)], || modrinth_lookup("", "sodium"));
+        assert_eq!(r.unwrap(), ("AANobbMI".into(), "Sodium".into(), "https://i/x.png".into()));
+        assert!(seen[0].starts_with("GET /v2/project/sodium"));
+        let (r, _) = with_mock(1, vec![("GET /v2/project/nope", 404, "{}")], || modrinth_lookup("t", "nope"));
+        assert!(r.unwrap_err().contains("не знайдено"));
+        let (r, seen) = with_mock(1, vec![("GET /v1/mods/search?gameId=432&slug=jei", 200, r#"{"data":[{"id":238222,"name":"JEI","logo":{"thumbnailUrl":"https://i/j.png"}}]}"#)], || curse_lookup_slug("k", "jei"));
+        assert_eq!(r.unwrap(), ("238222".into(), "JEI".into(), "https://i/j.png".into()));
+        assert!(seen[0].to_lowercase().contains("x-api-key: k"));
+        let (r, _) = with_mock(1, vec![("GET /v1/mods/search", 200, r#"{"data":[]}"#)], || curse_lookup_slug("k", "zzz"));
+        assert!(r.unwrap_err().contains("не знайдено"));
+    }
+
+    #[test]
+    fn project_filter_duplicate() {
+        let mk = |n: &str, m: &str, c: &str| Project { name: n.into(), modrinth_id: m.into(), curse_id: c.into(), ..Default::default() };
+        let mut cfg = Config { projects: vec![mk("Alpha Mod", "AbC123", ""), mk("Beta", "", "777")], ..Default::default() };
+        assert_eq!(filter_projects(&cfg.projects, ""), vec![0, 1]);
+        assert_eq!(filter_projects(&cfg.projects, " alpha"), vec![0]);
+        assert_eq!(filter_projects(&cfg.projects, "abc1"), vec![0]);
+        assert_eq!(filter_projects(&cfg.projects, "77"), vec![1]);
+        assert!(filter_projects(&cfg.projects, "zzz").is_empty());
+        ensure_ids(&mut cfg);
+        cfg.projects[0].pinned = true;
+        let a = duplicate_project(&mut cfg, 0).unwrap();
+        let b = duplicate_project(&mut cfg, 0).unwrap();
+        assert_eq!((cfg.projects[a].name.as_str(), cfg.projects[b].name.as_str()), ("Alpha Mod (копія)", "Alpha Mod (копія 2)"));
+        assert!(!cfg.projects[a].pinned && cfg.projects[a].modrinth_id == "AbC123");
+        let ids: std::collections::HashSet<_> = cfg.projects.iter().map(|p| p.id.clone()).collect();
+        assert_eq!(ids.len(), cfg.projects.len());
+        assert!(duplicate_project(&mut cfg, 99).is_none());
+    }
+
+    #[test]
+    fn jar_dependencies_detected() {
+        let d = tmp_dir("deps");
+        let f = d.join("d.jar");
+        zip_with(&f, &[("fabric.mod.json", r#"{"version":"1","depends":{"minecraft":"1.20.1","fabricloader":">=0.14","java":">=17","fabric-api":"*","cloth-config":"*"}}"#)]);
+        let mut deps = read_jar(&f).unwrap().deps;
+        deps.sort();
+        assert_eq!(deps, vec!["cloth-config", "fabric-api"]);
+        let toml = "[[mods]]\nversion=\"1\"\n[[dependencies.m]]\nmodId=\"minecraft\"\nmandatory=true\n[[dependencies.m]]\nmodId=\"geckolib\"\nmandatory=true\n[[dependencies.m]]\nmodId=\"jei\"\nmandatory=false\n[[dependencies.m]]\nmodId=\"curios\"\ntype=\"required\"\n";
+        assert_eq!(toml_deps(toml), vec!["geckolib", "curios"]);
+    }
+
+    #[test]
+    fn project_name_template_and_draft_skip() {
+        let p = Project { name: "M".into(), ..Default::default() };
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(!j.contains("name_template") && !j.contains("\"draft\""), "{j}");
+        let q: Project = serde_json::from_str(r#"{"name":"M","name_template":"{project} {version}"}"#).unwrap();
+        let r = Release { number: "1.2".into(), ..Default::default() };
+        assert_eq!(render_template(&q.name_template, &q.name, &r), "M 1.2");
+        let d = Project { draft: Draft { number: "9".into(), ..Default::default() }, ..Default::default() };
+        assert!(strip_secrets(&d).draft.is_empty());
     }
 
     #[test]
@@ -2431,5 +2654,48 @@ mod tests {
         assert_eq!(read_text_capped(&f, 100).unwrap().len(), 100);
         assert_eq!(read_text_capped(&f, 10_000).unwrap().len(), 5000);
         assert!(read_text_capped(&d.join("nope.txt"), 10).is_err());
+    }
+
+    #[test]
+    fn token_clients_do_not_follow_cross_host_redirects() {
+        use std::io::{Read, Write};
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let evil = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        evil.set_nonblocking(true).unwrap();
+        let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (a_url, loc) = (format!("http://{}", a.local_addr().unwrap()), format!("http://{}/steal", evil.local_addr().unwrap()));
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = a.accept().unwrap();
+            let _ = s.read(&mut [0u8; 4096]);
+            let _ = write!(s, "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        *TEST_BASE.lock().unwrap_or_else(|e| e.into_inner()) = Some(a_url);
+        let r = {
+            let _b = BaseGuard;
+            curse_token_check("SECRET-TOKEN")
+        };
+        h.join().unwrap();
+        assert!(r.is_err(), "редирект на інший хост не слід виконувати: {r:?}");
+        assert!(evil.accept().is_err(), "токен не має дійти до іншого хоста");
+    }
+
+    #[test]
+    fn history_add_is_serialized() {
+        let d = tmp_dir("hist_race");
+        let p = d.join("history.jsonl");
+        let ths: Vec<_> = (0..8)
+            .map(|t| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    for i in 0..30 {
+                        history_add_at(&p, "P", &format!("{t}.{i}"), "Modrinth", &Ok("x".repeat(40_000)));
+                    }
+                })
+            })
+            .collect();
+        ths.into_iter().for_each(|t| t.join().unwrap());
+        // файл виріс понад 1 МБ, тож відбулась обрізка до 2000 рядків; жоден рядок не пошкоджений
+        let all = std::fs::read_to_string(&p).unwrap();
+        assert!(all.lines().count() > 0 && all.lines().all(|l| serde_json::from_str::<Value>(l).is_ok()));
     }
 }
