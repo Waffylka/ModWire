@@ -89,7 +89,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
                 app.number = "1.2.0".into();
                 app.changelog = "- Нові ефекти світла\n- Виправлено вильоти при завантаженні світу".into();
                 app.cfg.last.mc_versions = "1.20.1, 1.20.4".into();
-                app.cfg.last.loaders = vec!["Fabric".into(), "Forge".into()];
+                app.cfg.last.loaders = vec!["fabric".into(), "forge".into()];
             }
             if name == "publish_done" {
                 app.mr_res = Some(Ok("Версію створено https://modrinth.com/mod/aurora/version/1".into()));

@@ -29,7 +29,7 @@ A native desktop app written in Rust ([egui](https://github.com/emilk/egui)). Pi
 - **Publish history** with search, a failures-only filter, open / copy link for each published version, and CSV export.
 - **Auto-update.** An "update available" banner with an Update button (Windows). The download is verified (size, SHA-256 from the release when available), the folder must be writable, and if the new build crashes right after start the previous version is restored.
 - **Import and export of projects** without tokens, and a safe config save with a backup copy.
-- **Keyboard friendly.** Ctrl/Cmd+Enter publishes, Ctrl/Cmd+1/2/3 switches sections; screen reader labels are provided.
+- **Keyboard friendly.** Ctrl/Cmd+Enter publishes (from another section it first opens Publish so you can see the summary), Ctrl/Cmd+1/2/3 switches sections; screen reader labels are provided.
 
 ## Install
 
@@ -82,13 +82,13 @@ cargo clippy --all-targets
 
 The app checks [Releases](https://github.com/Waffylka/ModWire/releases) on startup and on demand (Settings → «Про застосунок» → «Перевірити оновлення»). When a newer version exists, a banner with an Update button appears: the file is downloaded, the app replaces itself and restarts. Automatic replacement works on Windows; on macOS the button opens the release page. Updating is disabled while a publish is running.
 
-Updates are accepted only from `https://github.com/Waffylka/ModWire/releases/download/…`, and the downloaded file is checked for size, SHA-256 and the Windows executable signature. If the release asset carries a SHA-256 digest, the download must match it, otherwise the update is cancelled; the update also needs write access to the folder with `modwire.exe` (it will not work from a protected folder such as Program Files). If the new copy exits with an error within a few seconds, the previous version is put back automatically. There are no code signatures: trust rests on HTTPS and access to this repository. The repository address is the `UPDATE_REPO` constant in `src/logic.rs`.
+Updates are accepted only from `https://github.com/Waffylka/ModWire/releases/download/…`, and the downloaded file is checked for size, SHA-256 and the Windows executable signature. If the release asset carries a SHA-256 digest, the download must match it, otherwise the update is cancelled; the update also needs write access to the folder with `modwire.exe` (it will not work from a protected folder such as Program Files). If the new copy exits with an error within a few seconds of launch, the previous version is put back automatically; the previous file (`modwire.exe.old`) is kept for 30 seconds after a restart, so a build that crashes later can be restored by renaming it back. There are no code signatures: trust rests on HTTPS and access to this repository. The repository address is the `UPDATE_REPO` constant in `src/logic.rs`.
 
 ## Environment variables
 
 - `MODWIRE_CONFIG_DIR` - keep the config, history, icon cache and lock file in another folder instead of `<config_dir>/mod-publisher`.
 - `MODWIRE_SHOT_DIR` - developer screenshot mode: saves PNGs of the main screens to this folder. It only starts when `MODWIRE_CONFIG_DIR` is set too, so your real data is never touched.
-- `MODWIRE_SHOT_SCALE` - UI scale for screenshot mode (for example `1.0`); `MODWIRE_SHOT_ONLY` limits it to scenes with that name.
+- `MODWIRE_SHOT_SCALE` - UI scale for screenshot mode (for example `1.0`); `MODWIRE_SHOT_ONLY` limits it to scenes whose name starts with that text.
 
 ## Known limitations
 

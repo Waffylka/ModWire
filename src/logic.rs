@@ -93,11 +93,24 @@ pub fn pin_perm(ps: &[Project]) -> Vec<usize> {
 
 /// Для export: прибирає зайві поля, схожі на секрети.
 fn strip_secrets(p: &Project) -> Project {
-    let mut q = p.clone();
-    q.extra.retain(|k, _| {
+    fn secret(k: &str) -> bool {
         let k = k.to_lowercase();
-        !["token", "key", "secret", "password", "auth"].iter().any(|w| k.contains(w))
-    });
+        ["token", "key", "secret", "password", "auth"].iter().any(|w| k.contains(w))
+    }
+    // ключі, схожі на секрети, прибираємо на будь-якій глибині невідомих полів
+    fn scrub(v: &mut Value) {
+        match v {
+            Value::Object(m) => {
+                m.retain(|k, _| !secret(k));
+                m.values_mut().for_each(scrub);
+            }
+            Value::Array(a) => a.iter_mut().for_each(scrub),
+            _ => {}
+        }
+    }
+    let mut q = p.clone();
+    q.extra.retain(|k, _| !secret(k));
+    q.extra.values_mut().for_each(scrub);
     q
 }
 
@@ -279,7 +292,7 @@ pub fn history_link(e: &Value) -> Option<String> {
 
 fn csv_cell(s: &str) -> String {
     // лапки подвоюємо; формули Excel (=,+,-,@) нейтралізуємо апострофом
-    let s = if s.starts_with(['=', '+', '-', '@']) { format!("'{s}") } else { s.to_string() };
+    let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) { format!("'{s}") } else { s.to_string() };
     format!("\"{}\"", s.replace('"', "\"\"").replace(['\r', '\n'], " "))
 }
 
@@ -538,7 +551,9 @@ fn jar_entry(z: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<Strin
 pub fn compat_warnings(info: &JarInfo, mc: &[String], loaders: &[String]) -> Vec<String> {
     let mut w = vec![];
     if !info.loaders.is_empty() {
-        let missing: Vec<&String> = loaders.iter().filter(|l| !info.loaders.contains(&l.as_str())).collect();
+        // Quilt запускає Fabric-моди, тож для fabric-файлу quilt не вважаємо помилкою
+        let ok = |l: &str| info.loaders.contains(&l) || (l == "quilt" && info.loaders.contains(&"fabric"));
+        let missing: Vec<&String> = loaders.iter().filter(|l| !ok(l.as_str())).collect();
         if !missing.is_empty() {
             let m: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
             w.push(format!("Файл виглядає як {}, але вибрано також: {}. Перевірте лоадери.", info.loaders.join("/"), m.join(", ")));
@@ -2294,5 +2309,20 @@ mod tests {
         assert_eq!(cfg.unwrap(), d.join("config.json"));
         assert_eq!(hist.unwrap(), d.join("history.jsonl"));
         assert!(icon.unwrap().starts_with(d.join("icons")));
+    }
+
+    #[test]
+    fn final_review_fixes() {
+        // Quilt запускає Fabric-моди
+        let info = JarInfo { loaders: vec!["fabric"], ..Default::default() };
+        assert!(compat_warnings(&info, &[], &["fabric".into(), "quilt".into()]).is_empty());
+        assert!(!compat_warnings(&info, &[], &["forge".into()]).is_empty());
+        // CSV: формули, що починаються з табуляції чи CR
+        assert!(csv_cell(&format!("{}=1+1", char::from(9))).starts_with("\"'") && csv_cell("=1+1").starts_with("\"'") && csv_cell(&format!("{}@x", char::from(13))).starts_with("\"'"));
+        // секрети у вкладених невідомих полях
+        let mut p = Project::default();
+        p.extra.insert("future".into(), json!({"api_token": "x", "ok": 1, "deep": [{"secret": "y", "name": "n"}]}));
+        let s = serde_json::to_string(&strip_secrets(&p)).unwrap();
+        assert!(!s.contains("api_token") && !s.contains("secret") && s.contains("\"ok\":1") && s.contains("\"name\":\"n\""), "{s}");
     }
 }

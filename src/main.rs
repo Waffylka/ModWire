@@ -249,6 +249,7 @@ fn setup_style(ctx: &egui::Context) {
     v.widgets.hovered.fg_stroke = Stroke::new(1.5, TEXT);
     v.widgets.active.fg_stroke = Stroke::new(1.5, ACCENT);
     v.slider_trailing_fill = true;
+    ctx.set_theme(egui::ThemePreference::Dark); // застосунок лише темний: світла тема egui мала б синій дефолт
     ctx.set_visuals(v);
 
     ctx.all_styles_mut(|s| {
@@ -1962,6 +1963,7 @@ impl App {
                 (self.number, self.name, self.changelog, self.file) = Default::default();
                 self.number = self.sel.and_then(|i| self.cfg.projects.get(i)).map(|p| bump(&p.last_number)).unwrap_or_default();
                 (self.use_mr, self.use_cf, self.mr_res, self.cf_res) = (true, true, None, None);
+                (self.file_info, self.file_note) = (None, String::new());
                 self.msg.clear();
             }
             ui.add_space(8.0);
@@ -2056,7 +2058,7 @@ impl App {
                                 self.hist_confirm = false;
                             }
                         } else {
-                            if ghost_btn(ui, Some(Ic::File), "Експорт у CSV…").on_hover_text("Усі записи історії для таблиці").clicked() {
+                            if ghost_btn(ui, Some(Ic::File), "Експорт у CSV…").on_hover_text("Останні записи історії (до 300) у таблицю").clicked() {
                                 export = true;
                             }
                             if ghost_btn(ui, None, "Очистити історію").clicked() {
@@ -2533,7 +2535,7 @@ impl eframe::App for App {
                 self.tab = t; // Ctrl+1/2/3
             }
         }
-        // Ctrl+Enter публікує з будь-якого розділу (якщо форма готова і немає діалогу)
+        // Ctrl+Enter: з іншого розділу лише відкриває «Публікацію» (щоб побачити підсумок), там уже публікує (якщо форма готова і немає діалогу)
         if self.pending == 0 && !self.add_open && self.merge_ask.is_empty() && !self.cfg.projects.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) {
             let proj = self.sel.and_then(|i| self.cfg.projects.get(i));
             let (has_mr, has_cf) = proj.map_or((false, false), |p| (!p.modrinth_id.is_empty(), !p.curse_id.is_empty()));
@@ -2610,7 +2612,16 @@ fn main() -> eframe::Result {
         }
         other => other.ok().flatten(),
     };
-    cleanup_update(); // лише під блокуванням: друга копія не має стерти .new, який хтось завантажує
+    // лише під блокуванням: друга копія не має стерти .new, який хтось завантажує.
+    // Після оновлення .old лишається ще 30 с: якщо нова копія не стартує, його можна повернути вручну.
+    if std::env::args().any(|a| a == "--updated") {
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            cleanup_update();
+        });
+    } else {
+        cleanup_update();
+    }
     let mut vb = egui::ViewportBuilder::default().with_inner_size([900.0, 580.0]).with_min_inner_size([760.0, 480.0]);
     if let Some(i) = app_icon() {
         vb = vb.with_icon(i);
