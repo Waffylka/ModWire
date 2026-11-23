@@ -93,6 +93,7 @@ struct App {
     mr_loading: bool,
     mr_msg: String, // помилка завантаження списку Modrinth, показується під кнопкою
     cf_id: String,
+    cur_name: String,                // назва версії поточної публікації (для історії)
     proj_chk: Chk,                   // результат перевірки проєкту CurseForge
     featured: bool,                  // Modrinth: рекомендована версія
     send_deps: bool,                 // Modrinth: надсилати залежності з файлу
@@ -176,11 +177,12 @@ enum Chk {
     Checking,
     Ok(String),
     Err(String),
+    Stamp(u64), // «Перевірено N тому»: час (epoch, с), текст щоразу обчислюється наново
 }
 
 /// Стан «перевірено N тому» зі збереженої відмітки часу (0 = не перевірялось).
 fn checked_msg(t: u64) -> Chk {
-    if t == 0 { Chk::Idle } else { Chk::Ok(format!("Перевірено {}", ago(t))) }
+    if t == 0 { Chk::Idle } else { Chk::Stamp(t) }
 }
 
 /// « · 2.5 МБ/с · ще ~8 с» для рядка прогресу завантаження.
@@ -196,6 +198,10 @@ fn speed_text(bps: u64, eta: u64) -> String {
 fn status(ui: &mut egui::Ui, c: &Chk) {
     match c {
         Chk::Idle => {}
+        Chk::Stamp(t) => {
+            icon_label_c(ui, Ic::Check, SUCCESS, &format!("Перевірено {}", ago(*t)), SUCCESS);
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(60)); // текст «N хв тому» оновлюється раз на хвилину
+        }
         Chk::Checking => {
             ui.spinner();
             ui.label(RichText::new("Перевіряємо…").color(MUTED));
@@ -874,7 +880,7 @@ impl App {
         let rt = RELEASE_TYPES.iter().position(|r| *r == l.release_type).unwrap_or(0);
         let mut app = Self {
             tab: Tab::Projects, tx, rx, add_open: false, target: None, mr_list: vec![], mr_loading: false, mr_msg: String::new(),
-            cf_id: String::new(), proj_chk: Chk::Idle, featured: false, send_deps: false, extra_files: vec![], mr_link: String::new(), sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), sel, file: None,
+            cf_id: String::new(), cur_name: String::new(), proj_chk: Chk::Idle, featured: false, send_deps: false, extra_files: vec![], mr_link: String::new(), sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), sel, file: None,
             name: String::new(), number: sel.and_then(|i| cfg.projects.get(i)).map(|p| bump(&p.last_number)).unwrap_or_default(), release_type: rt, changelog: String::new(),
             use_mr: true, use_cf: true, mr_res: None, cf_res: None, pending: 0, msg: String::new(),
             show_tokens: false, confirm_del: None, confirm_clear: false, check_msg: checked_msg(cfg.modrinth_checked), up_mr: Up::default(), up_cf: Up::default(), cur_cl: String::new(), cur_meta: Default::default(),
@@ -1024,7 +1030,7 @@ impl App {
     }
 
     fn mask(&self, e: String) -> String {
-        mask_token(&e, &[&self.cfg.modrinth_token, &self.cfg.curse_token, &self.cfg.curse_core_key])
+        mask_secrets(&e, &[&self.cfg.modrinth_token, &self.cfg.curse_token, &self.cfg.curse_core_key])
     }
 
     /// Токени не потрапляють у тексти помилок: сервер міг ехо-нути заголовок.
@@ -1168,7 +1174,14 @@ impl App {
                 }
                 Msg::Done(p, r) => {
                     self.pending = self.pending.saturating_sub(1);
-                    history_add(&self.cur.0, &self.cur.1, if matches!(p, P::Mr) { "Modrinth" } else { "CurseForge" }, &r);
+                    let ctx = HistCtx {
+                        project_id: self.cur_idx.and_then(|i| self.cfg.projects.get(i)).map(|p| p.id.clone()).unwrap_or_default(),
+                        name: self.cur_name.clone(),
+                        release_type: self.cur_meta.2.clone(),
+                        mc_versions: self.cur_meta.0.clone(),
+                        loaders: self.cur_meta.1.clone(),
+                    };
+                    history_add_ctx(&self.cur.0, &self.cur.1, if matches!(p, P::Mr) { "Modrinth" } else { "CurseForge" }, &r, &ctx);
                     self.history = history_load(HIST_MAX);
                     if r.is_ok() && let Some(i) = self.cur_idx.take() {
                         if let Some(p) = self.cfg.projects.get_mut(i) {
@@ -1207,6 +1220,9 @@ impl App {
                 }
             }
             StartAction::OfferRollback => {
+                if self.quit {
+                    return; // повторний Enter, поки програма виходить: відкат не повторюємо
+                }
                 let (mut back, mut keep) = (false, false);
                 egui::Modal::new(egui::Id::unique("rollback_dialog")).backdrop_color(Color32::from_black_alpha(160)).frame(modal_frame()).show(ctx, |ui| {
                     ui.set_width(420.0);
@@ -1216,9 +1232,9 @@ impl App {
                     hint(ui, "Збережена копія попередньої версії лежить поруч із програмою (modwire.exe.old).");
                     ui.add_space(16.0);
                     ui.horizontal(|ui| {
-                        if ui.add(primary("Повернути попередню")).clicked() { back = true; }
+                        if ghost_btn(ui, None, "Лишити цю").clicked() { keep = true; }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ghost_btn(ui, None, "Лишити цю").clicked() { keep = true; }
+                            if ui.add(primary("Повернути попередню")).clicked() { back = true; }
                         });
                     });
                 });
@@ -1246,16 +1262,16 @@ impl App {
         }
         let (mut stay, mut quit) = (false, false);
         let r = egui::Modal::new(egui::Id::unique("close_dialog")).backdrop_color(Color32::from_black_alpha(160)).frame(modal_frame()).show(ctx, |ui| {
-            ui.set_width(400.0);
+            ui.set_width(420.0);
             ui.label(title("Публікація триває"));
             ui.add_space(8.0);
             ui.label("Файл ще надсилається. Якщо закрити програму зараз, публікацію буде перервано, а версія могла частково з'явитись на сайті.");
             hint(ui, "Після виходу перевірте результат на сторінці проєкту.");
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                if ui.add(primary("Лишитись")).clicked() { stay = true; }
+                if ui.add(danger("Перервати й вийти")).clicked() { quit = true; }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(danger("Перервати й вийти")).clicked() { quit = true; }
+                    if ui.add(primary("Лишитись")).clicked() { stay = true; }
                 });
             });
         });
@@ -1298,9 +1314,38 @@ impl App {
         }
     }
 
+    /// «Повторити з цього запису»: проєкт, номер, назва версії, тип, MC і лоадери з історії; файл і зміни обирають заново.
+    fn restore_history(&mut self, e: &serde_json::Value) {
+        let Some(r) = restore_from_history(e) else { return };
+        let name = e["project"].as_str().unwrap_or("");
+        let idx = self.cfg.projects.iter().position(|p| !r.draft.project.is_empty() && p.id == r.draft.project).or_else(|| self.cfg.projects.iter().position(|p| p.name == name));
+        let Some(i) = idx else {
+            self.notice = format!("Проєкт «{name}» уже видалено зі списку: форму не відновлено.");
+            return;
+        };
+        self.select_project(Some(i));
+        self.number = r.draft.number;
+        self.name = r.draft.name;
+        if let Some(t) = RELEASE_TYPES.iter().position(|x| *x == r.release_type) {
+            self.release_type = t;
+        }
+        if !r.mc_versions.is_empty() {
+            self.cfg.last.mc_versions = r.mc_versions;
+        }
+        if !r.loaders.is_empty() {
+            self.cfg.last.loaders = r.loaders;
+        }
+        (self.use_mr, self.use_cf, self.mr_res, self.cf_res) = (true, true, None, None);
+        self.tab = Tab::Publish;
+        self.notice = "Форму відновлено із запису історії. Оберіть файл і перевірте зміни.".into();
+    }
+
     /// Видаляє запис проєкту i і зсуває всі збережені індекси.
     fn remove_project(&mut self, i: usize) {
         self.confirm_del = None;
+        if i >= self.cfg.projects.len() {
+            return; // застарілий індекс (подвійне підтвердження): нічого не видаляємо і не панікуємо
+        }
         self.cfg.projects.remove(i);
         let shift = |o: Option<usize>| match o { Some(s) if s == i => None, Some(s) if s > i && s != usize::MAX => Some(s - 1), o => o }; // MAX = маркер «немає», не зсуваємо
         let new_sel = shift(self.sel);
@@ -1389,7 +1434,7 @@ impl App {
         let mut choice = None;
         let mut hide = false;
         let r = egui::Modal::new(egui::Id::unique("merge_dialog")).backdrop_color(Color32::from_black_alpha(160)).frame(modal_frame()).show(ctx, |ui| {
-            ui.set_width(400.0);
+            ui.set_width(420.0);
             ui.horizontal(|ui| {
                 ui.label(title("Однакова назва"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1535,7 +1580,14 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 if self.upd_applying {
                     ui.spinner();
+                    let (done, total) = update_progress();
+                if total > 0 {
+                    ui.add(egui::ProgressBar::new((done as f32 / total as f32).min(1.0)).desired_width(160.0).desired_height(8.0).fill(ACCENT).animate(false));
+                    hint(ui, &format!("Завантажуємо оновлення… {} з {} МБ. Програма перезапуститься сама.", done >> 20, total >> 20));
+                } else {
                     hint(ui, "Завантажуємо оновлення… Програма перезапуститься сама.");
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
                     return;
                 }
                 if url.is_empty() || !cfg!(windows) {
@@ -1662,6 +1714,10 @@ impl App {
         let (mut pin, mut sort, mut pin_only) = (None::<usize>, false, false);
         let (mut dup, mut toggle, mut batch) = (None::<usize>, None::<String>, false);
         let sel_mode = self.sel_mode;
+        // Esc скасовує підтвердження видалення (одиночного й пакетного)
+        if (self.batch_confirm || self.confirm_del.is_some()) && !self.add_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            (self.batch_confirm, self.confirm_del) = (false, None);
+        }
         let confirm = self.confirm_del;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if n > 1 {
@@ -1683,6 +1739,7 @@ impl App {
                             if ghost_btn(ui, Some(Ic::Cross), "Скасувати").clicked() {
                                 self.batch_confirm = false;
                             }
+                            hint(ui, "Видалить записи в Modwire. На сайтах нічого не зміниться.");
                         } else if ui.add(danger(&format!("Видалити вибрані ({})", self.picked.len()))).clicked() {
                             self.batch_confirm = true;
                         }
@@ -2439,7 +2496,7 @@ impl App {
                     }
                 });
             }
-            egui::ScrollArea::vertical().id_salt("pub_res").max_height((ctx.content_rect().height() * 0.2).clamp(64.0, 220.0)).auto_shrink([false, true]).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("pub_res").max_height((ctx.content_rect().height() * if ctx.content_rect().height() < 600.0 { 0.1 } else { 0.2 }).clamp(44.0, 220.0)).auto_shrink([false, true]).show(ui, |ui| {
                 for (name, f, col, extra) in &bars {
                     // підпис над смугою: довжина тексту не зсуває початок смуги, обидві платформи вирівняні
                     // рядок: назва · смуга · відсоток і швидкість (фіксована колонка назви: смуги вирівняні)
@@ -2602,6 +2659,7 @@ impl App {
                     ui.scroll_to_cursor(Some(egui::Align::TOP));
                 }
                 let (mut clear, mut export, mut copied) = (false, false, false);
+                let mut again: Option<serde_json::Value> = None;
                 let found =history_filter(&self.history, &self.hist_q, self.hist_fail);
                 let limit = if self.hist_all { usize::MAX } else { 10 };
                 let total = found.len();
@@ -2617,7 +2675,7 @@ impl App {
                                 self.hist_confirm = false;
                             }
                         } else {
-                            if ghost_btn(ui, Some(Ic::File), "Експорт у CSV…").on_hover_text("Останні записи історії (до 300) у таблицю").clicked() {
+                            if ghost_btn(ui, Some(Ic::File), "Експорт у CSV…").on_hover_text("Уся історія з файлу у таблицю").clicked() {
                                 export = true;
                             }
                             if ghost_btn(ui, None, "Очистити історію").clicked() {
@@ -2630,23 +2688,30 @@ impl App {
                     }
                     let avail = ui.available_width();
                     let narrow = avail < 560.0;
-                    egui::Grid::new("history_grid").num_columns(if narrow { 2 } else { 4 }).spacing([16.0, 14.0]).min_col_width(60.0).show(ui, |ui| {
+                    egui::Grid::new("history_grid").num_columns(if narrow { 1 } else { 3 }).spacing([16.0, 14.0]).min_col_width(60.0).show(ui, |ui| {
                         ui.spacing_mut().interact_size.y = 22.0; // комірки рядка вирівнюються по верху, без зсуву від висоти кнопки
                         for e in found.iter().take(limit) {
                             let ok = e["ok"].as_bool().unwrap_or(false);
                             let col = if ok { SUCCESS } else { ERROR };
                             let msg = e["msg"].as_str().unwrap_or("");
-                            ui.horizontal_top(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::hover());
-                                draw_icon(ui.painter(), rect.center(), if ok { Ic::Check } else { Ic::Cross }, 14.0, col);
-                                ui.label(RichText::new(if ok { "Готово" } else { "Помилка" }).color(col)).on_hover_text(msg);
-                            });
                             let vr = ui.vertical(|ui| {
-                                ui.set_max_width(if narrow { (avail - 130.0).max(120.0) } else { 220.0 });
-                                let full = format!("{} {}", e["project"].as_str().unwrap_or("?"), e["number"].as_str().unwrap_or(""));
-                                let tip = if msg.is_empty() { full.clone() } else { format!("{full}\n{msg}") };
-                                ui.add(egui::Label::new(full).truncate()).on_hover_text(tip);
+                                // статус усередині першого рядка комірки: Grid центрує окрему комірку по висоті рядка і зсуває її від назви
+                                ui.set_max_width(if narrow { (avail - 40.0).max(160.0) } else { 330.0 });
+                                ui.horizontal(|ui| {
+                                    ui.allocate_ui_with_layout(egui::vec2(96.0, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.set_min_width(96.0);
+                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::hover());
+                                        draw_icon(ui.painter(), rect.center(), if ok { Ic::Check } else { Ic::Cross }, 14.0, col);
+                                        ui.label(RichText::new(if ok { "Готово" } else { "Помилка" }).color(col)).on_hover_text(msg);
+                                    });
+                                    let full = format!("{} {}", e["project"].as_str().unwrap_or("?"), e["number"].as_str().unwrap_or(""));
+                                    let tip = if msg.is_empty() { full.clone() } else { format!("{full}\n{msg}") };
+                                    ui.add(egui::Label::new(full).truncate()).on_hover_text(tip);
+                                });
+                                ui.horizontal_top(|ui| { // другорядні рядки вирівняні по назві проєкту, а не під статусом
+                                ui.add_space(104.0);
+                                ui.vertical(|ui| {
                                 if narrow {
                                     hint(ui, &format!("{} · {}", e["platform"].as_str().unwrap_or(""), ago(e["t"].as_u64().unwrap_or(0))));
                                 }
@@ -2660,10 +2725,18 @@ impl App {
                                         }
                                     });
                                 }
+                                if e["number"].as_str().is_some_and(|n| !n.is_empty()) && self.pending == 0 {
+                                    let r = ui.add(egui::Label::new(RichText::new("Повторити з цього запису").color(ACCENT).size(HINT_SZ)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    if r.on_hover_text("Підставити проєкт, номер, тип, MC і лоадери у форму публікації").clicked() {
+                                        again = Some((*e).clone());
+                                    }
+                                }
                                 if !ok {
-                                    let m: String = msg.chars().take(110).collect();
+                                    let m: String = msg.chars().take(300).collect();
                                     ui.label(RichText::new(m).color(MUTED).size(HINT_SZ));
                                 }
+                                });
+                                });
                             });
                             let r = if narrow {
                                 vr.response // платформа і час уже в другому рядку
@@ -2690,12 +2763,14 @@ impl App {
                 if copied {
                     self.notice = "Посилання скопійовано.".into();
                 }
+                if let Some(e) = again {
+                    self.restore_history(&e);
+                }
                 if export {
-                    let csv = history_csv(&self.history);
                     self.spawn_opt(ui.ctx(), move || {
                         let p = rfd::FileDialog::new().set_file_name("modwire-history.csv").add_filter("CSV", &["csv"]).save_file()?;
-                        Some(Msg::Notice(match std::fs::write(&p, csv) {
-                            Ok(()) => format!("Історію експортовано: {}", p.display()),
+                        Some(Msg::Notice(match history_export_to(&p) {
+                            Ok(n) => format!("Історію експортовано ({n} записів): {}", p.display()),
                             Err(e) => format!("Не вдалося записати файл: {e}"),
                         }))
                     });
@@ -2709,7 +2784,10 @@ impl App {
                 }
             } else {
                 ui.add_space(8.0);
-                hint(ui, "Історія публікацій з'явиться тут після першої відправки.");
+                egui::Frame::new().stroke(Stroke::new(1.0, BORDER)).corner_radius(egui::CornerRadius::same(CARD_R)).inner_margin(egui::Margin::symmetric(CARD_PAD, 12)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    icon_label_c(ui, Ic::Info, MUTED, "Історія порожня: записи з'являться після першої публікації.", MUTED);
+                });
             }
         }
     }
@@ -2720,6 +2798,7 @@ impl App {
         let (Some(si), Some(file)) = (self.sel, self.file.clone()) else { return };
         let Some(p) = self.cfg.projects.get(si).cloned() else { return };
         self.cur = (p.name.clone(), rel.number.clone());
+        self.cur_name = rel.name.clone();
         self.cfg.last.project = si;
         self.cur_idx = Some(si);
         self.cfg.last.release_type = rel.release_type.clone();
@@ -3262,7 +3341,7 @@ mod tests {
     fn progress_and_checked_text() {
         assert_eq!(speed_text(2_621_440, 8), " · 2.5 МБ/с · ще ~8 с");
         assert!(matches!(checked_msg(0), Chk::Idle));
-        assert!(matches!(checked_msg(super::now_secs()), Chk::Ok(m) if m.contains("щойно")));
+        assert!(matches!(checked_msg(super::now_secs()), Chk::Stamp(t) if super::ago(t).contains("щойно")));
     }
 
     #[test]
@@ -3362,7 +3441,21 @@ mod tests {
         app.poll();
         let shown = format!("{:?}{:?}", app.check_msg, app.key_msg);
         assert!(!shown.contains("TOPSECRET") && !shown.contains("abcdef"), "{shown}");
-        assert!(matches!(&app.mr_res, Some(Err(e)) if !e.contains("TOPSECRET") && e.contains("***")));
+        assert!(matches!(&app.mr_res, Some(Err(e)) if !e.contains("TOPSECRET") && e.contains("•••")));
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    #[test]
+    fn stale_or_repeated_delete_confirmation_is_harmless() {
+        let (_g, mut app) = test_app("stale_del");
+        app.confirm_del = Some(1);
+        app.remove_project(1);
+        app.remove_project(1); // подвійне підтвердження: тепер це «c», видаляється один раз на запит
+        assert_eq!(app.cfg.projects.len(), 1);
+        app.remove_project(0);
+        app.remove_project(0);
+        app.remove_project(usize::MAX);
+        assert!(app.cfg.projects.is_empty() && app.confirm_del.is_none());
         unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
     }
 }

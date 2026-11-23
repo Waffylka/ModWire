@@ -44,6 +44,8 @@ const SCENES: &[(&str, f32, f32)] = &[
     ("settings_update", 900.0, 580.0), ("settings_updating", 900.0, 580.0), ("settings_updateerr", 900.0, 580.0),
     ("publish_busy", 900.0, 580.0), ("publish_busy", 760.0, 480.0),
     ("close_dialog", 900.0, 580.0),
+    ("rollback_dialog", 900.0, 580.0),
+    ("history_empty", 900.0, 2100.0), ("history_errors", 900.0, 2700.0),
     ("icons", 900.0, 520.0),
 ];
 
@@ -69,6 +71,8 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
     app.cfg.curse_token.clear();
     (app.mr_res, app.cf_res, app.msg) = (None, None, String::new());
     app.notice.clear();
+    app.start_act = super::StartAction::Clean;
+    (app.hist_q, app.hist_fail) = (String::new(), false);
     (app.update, app.upd_applying, app.upd_err, app.pending, app.confirm_close, app.featured) = (None, false, String::new(), 0, false, false);
     match name {
         "projects" | "projects_tall" => app.tab = Tab::Projects,
@@ -81,7 +85,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
             app.merge_hidden = false;
             app.merge_ask = vec![(0, super::Project { name: "Aurora Lights".into(), curse_id: "999".into(), ..Default::default() })];
         }
-        "publish" | "publish_tall" | "publish_done" | "publish_busy" | "close_dialog" => {
+        "publish" | "publish_tall" | "publish_done" | "publish_busy" | "close_dialog" | "rollback_dialog" | "history_empty" | "history_errors" => {
             app.cfg.modrinth_token = "fixture".into();
             app.cfg.curse_token = "fixture".into();
             app.tab = Tab::Publish;
@@ -112,13 +116,24 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
                 app.mr_res = Some(Ok("Версію створено https://modrinth.com/mod/aurora/version/1".into()));
                 app.cf_res = Some(Err("Сервер відповів HTTP 403: токен не має права завантажувати файли".into()));
             }
-            {
+            if name == "rollback_dialog" {
+                app.start_act = super::StartAction::OfferRollback;
+            }
+            if name != "history_empty" {
                 let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                 app.history = vec![
                     serde_json::json!({"ok": true, "project": "Aurora Lights", "number": "1.1.0", "platform": "Modrinth", "t": t - 3600, "msg": ""}),
                     serde_json::json!({"ok": false, "project": "Aurora Lights", "number": "1.1.0", "platform": "CurseForge", "t": t - 3500, "msg": "HTTP 403: токен не має права"}),
                     serde_json::json!({"ok": true, "project": "Stone Tools Plus", "number": "0.9.2", "platform": "Modrinth", "t": t - 86400 * 3, "msg": ""}),
                 ];
+                if name == "history_errors" {
+                    let long = "HTTP 400: поле game_versions містить версію 1.20.9, якої не існує на Modrinth; перевірте список версій Minecraft і спробуйте ще раз після виправлення (довге повідомлення для перевірки переносу).";
+                    for k in 0..8u64 {
+                        app.history.push(serde_json::json!({"ok": k % 3 == 0, "project": "Дуже довга назва мода для перевірки переносу в історії", "number": format!("2.{k}.0-beta.{k}"), "platform": if k % 2 == 0 { "Modrinth" } else { "CurseForge" }, "t": t - 7200 * (k + 1), "msg": if k % 3 == 0 { "" } else { long }}));
+                    }
+                }
+            } else {
+                app.history.clear();
             }
         }
         "settings" | "settings_tall" | "settings_update" | "settings_updating" | "settings_updateerr" => {

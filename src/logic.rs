@@ -358,18 +358,56 @@ pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Контекст запису історії для відновлення форми («Повторити з цього запису»). Усі поля необов'язкові.
+#[derive(Default, Clone, Debug)]
+pub struct HistCtx {
+    pub project_id: String,
+    pub name: String,
+    pub release_type: String,
+    pub mc_versions: String,
+    pub loaders: Vec<String>,
+}
+
 /// Дописує результат публікації в history.jsonl (помилки запису ігноруються).
-pub fn history_add(project: &str, number: &str, platform: &str, res: &Result<String, String>) {
+pub fn history_add_ctx(project: &str, number: &str, platform: &str, res: &Result<String, String>, ctx: &HistCtx) {
     if let Some(p) = history_path() {
-        history_add_at(&p, project, number, platform, res);
+        history_add_with(&p, project, number, platform, res, ctx);
     }
+}
+
+/// Що відновлюється з запису історії.
+#[derive(Debug, PartialEq)]
+pub struct HistRestore {
+    /// project = id проєкту (або порожній для старих записів), number/name — з запису; changelog і файл не зберігаються.
+    pub draft: Draft,
+    pub release_type: String,
+    pub mc_versions: String,
+    pub loaders: Vec<String>,
+}
+
+/// Дані форми з запису історії. None, якщо в записі немає номера. Старі записи (без нових полів) дають лише проєкт-назву в `project`
+/// порожнім, а номер із запису: проєкт шукається за назвою на боці UI.
+pub fn restore_from_history(e: &Value) -> Option<HistRestore> {
+    let number = e["number"].as_str().filter(|n| !n.trim().is_empty())?.to_string();
+    let g = |k: &str| e[k].as_str().unwrap_or("").to_string();
+    Some(HistRestore {
+        draft: Draft { project: g("pid"), number, name: g("vname"), ..Default::default() },
+        release_type: g("rtype"),
+        mc_versions: g("mc"),
+        loaders: e["loaders"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+    })
 }
 
 fn is_repeat(recent: &[(PathBuf, String, u64)], p: &Path, key: &str, now: u64) -> bool {
     recent.iter().any(|(pp, k, t)| pp == p && k == key && now.saturating_sub(*t) < 5)
 }
 
+#[cfg(test)]
 fn history_add_at(p: &Path, project: &str, number: &str, platform: &str, res: &Result<String, String>) {
+    history_add_with(p, project, number, platform, res, &HistCtx::default());
+}
+
+fn history_add_with(p: &Path, project: &str, number: &str, platform: &str, res: &Result<String, String>, ctx: &HistCtx) {
     use std::io::Write;
     // запис і обрізання під одним замком: два потоки публікації (Modrinth і CurseForge) не гублять рядки
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -387,7 +425,16 @@ fn history_add_at(p: &Path, project: &str, number: &str, platform: &str, res: &R
         }
         recent.push((p.to_path_buf(), key, now));
     }
-    let line = json!({"t": now, "project": project, "number": number, "platform": platform, "ok": res.is_ok(), "msg": msg});
+    let mut line = json!({"t": now, "project": project, "number": number, "platform": platform, "ok": res.is_ok(), "msg": msg});
+    // нові поля додаємо лише коли вони є: старі версії програми їх ігнорують, а старі рядки читаються як раніше
+    for (k, v) in [("pid", &ctx.project_id), ("vname", &ctx.name), ("rtype", &ctx.release_type), ("mc", &ctx.mc_versions)] {
+        if !v.is_empty() {
+            line[k] = json!(v);
+        }
+    }
+    if !ctx.loaders.is_empty() {
+        line["loaders"] = json!(ctx.loaders);
+    }
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
@@ -420,7 +467,7 @@ fn history_load_at(p: &Path, n: usize) -> Vec<Value> {
     }
     let s = String::from_utf8_lossy(&buf);
     let body = if start > 0 { s.split_once('\n').map_or("", |x| x.1) } else { &s };
-    body.lines().rev().filter_map(|l| serde_json::from_str(l).ok()).take(n).collect()
+    body.lines().rev().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(Value::is_object).take(n).collect()
 }
 
 /// Видаляє всю історію публікацій.
@@ -443,7 +490,7 @@ pub fn history_filter<'a>(h: &'a [Value], query: &str, only_fail: bool) -> Vec<&
     let q = query.trim().to_lowercase();
     h.iter()
         .filter(|e| !only_fail || e["ok"] != true)
-        .filter(|e| q.is_empty() || ["project", "number", "platform", "msg"].iter().any(|k| e[*k].as_str().is_some_and(|s| s.to_lowercase().contains(&q))))
+        .filter(|e| q.is_empty() || ["project", "number", "platform", "msg", "vname"].iter().any(|k| e[*k].as_str().is_some_and(|s| s.to_lowercase().contains(&q))))
         .collect()
 }
 
@@ -462,16 +509,48 @@ fn csv_cell(s: &str) -> String {
 }
 
 /// Історія у CSV (від старих до нових): час UTC, проєкт, номер, платформа, результат, повідомлення.
+#[cfg(test)]
 pub fn history_csv(h: &[Value]) -> String {
-    let mut out = String::from("\u{feff}time_utc,project,number,platform,result,message\r\n");
+    let mut out = String::from(CSV_HEAD);
     for e in h.iter().rev() {
-        let t = e["t"].as_u64().unwrap_or(0);
-        let (y, m, d) = ymd(t);
-        let when = format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", t % 86400 / 3600, t % 3600 / 60, t % 60);
-        let g = |k: &str| csv_cell(e[k].as_str().unwrap_or(""));
-        out += &format!("{when},{},{},{},{},{}\r\n", g("project"), g("number"), g("platform"), if e["ok"] == true { "ok" } else { "error" }, g("msg"));
+        out += &csv_row(e);
     }
     out
+}
+
+const CSV_HEAD: &str = "\u{feff}time_utc,project,number,platform,result,message\r\n";
+
+fn csv_row(e: &Value) -> String {
+    let t = e["t"].as_u64().unwrap_or(0);
+    let (y, m, d) = ymd(t);
+    let when = format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", t % 86400 / 3600, t % 3600 / 60, t % 60);
+    let g = |k: &str| csv_cell(e[k].as_str().unwrap_or(""));
+    format!("{when},{},{},{},{},{}\r\n", g("project"), g("number"), g("platform"), if e["ok"] == true { "ok" } else { "error" }, g("msg"))
+}
+
+/// Експортує ВСЮ історію з файлу в CSV потоково (рядок за рядком, без читання файлу в пам'ять); від старих до нових.
+/// Пошкоджені рядки пропускаються. Повертає кількість записів.
+pub fn history_export_to(dst: &Path) -> Result<usize, String> {
+    let src = history_path().ok_or("немає теки даних")?;
+    history_export_at(&src, dst)
+}
+
+fn history_export_at(src: &Path, dst: &Path) -> Result<usize, String> {
+    use std::io::{BufRead, Write};
+    let mut out = std::io::BufWriter::new(std::fs::File::create(dst).map_err(|e| format!("Не вдалося створити файл: {e}"))?);
+    out.write_all(CSV_HEAD.as_bytes()).map_err(|e| e.to_string())?;
+    let mut n = 0;
+    if let Ok(f) = std::fs::File::open(src) {
+        for line in std::io::BufReader::new(f).split(b'\n') {
+            let line = line.map_err(|e| e.to_string())?;
+            if let Ok(e) = serde_json::from_slice::<Value>(&line) {
+                out.write_all(csv_row(&e).as_bytes()).map_err(|e| e.to_string())?;
+                n += 1;
+            }
+        }
+    }
+    out.flush().map_err(|e| e.to_string())?;
+    Ok(n)
 }
 
 /// "5 хв тому" для запису з відміткою часу t.
@@ -672,16 +751,16 @@ fn bump_core(n: &str) -> String {
 
 fn human(st: reqwest::StatusCode) -> &'static str {
     match st.as_u16() {
-        400 => "Сервер відхилив дані (перевірте версії MC, лоадери, номер)",
+        400 => "Сервер відхилив дані. Перевірте версії MC, лоадери й номер версії та спробуйте знову",
         401 => "Токен недійсний або без потрібних прав. Створіть новий токен на сайті й вставте його в «Налаштування»",
-        403 => "Немає доступу до проєкту (перевірте токен і ID проєкту)",
-        404 => "Не знайдено (перевірте ID проєкту)",
-        409 | 422 => "Така версія вже існує або дані некоректні",
-        413 => "Файл завеликий",
-        429 => "Забагато запитів, спробуйте пізніше",
+        403 => "Немає доступу до проєкту. Перевірте токен і ID проєкту: токен має належати автору або учаснику проєкту",
+        404 => "Не знайдено. Перевірте ID проєкту",
+        409 | 422 => "Така версія вже існує або дані некоректні. Змініть номер версії або перевірте поля й спробуйте знову",
+        413 => "Файл завеликий для платформи. Оберіть менший файл (ліміт 500 МБ)",
+        429 => "Забагато запитів. Зачекайте хвилину й повторіть",
         408 | 502..=504 => "Сервіс тимчасово недоступний (помилка на боці сервера). Зачекайте кілька хвилин і повторіть; статус сервісу дивіться на його сайті",
-        500..=599 => "Помилка на боці сервера, спробуйте пізніше",
-        _ => "Помилка запиту",
+        500..=599 => "Помилка на боці сервера. Зачекайте й повторіть пізніше; якщо не минає, перевірте статус сервісу",
+        _ => "Помилка запиту. Перевірте дані й токен та повторіть; якщо не минає, напишіть автору програми",
     }
 }
 
@@ -1233,18 +1312,14 @@ fn sent_err(e: reqwest::Error) -> String {
     format!("{e}. Файл міг бути завантажений — перевірте на сайті перед повтором")
 }
 
+const NET_ADVICE: &str = "Немає зв'язку з сервером (мережа або таймаут). Перевірте інтернет, VPN чи брандмауер і спробуйте ще раз.";
+
 fn net_err(e: reqwest::Error) -> String {
     if e.is_timeout() || e.is_connect() {
-        format!("Немає зв'язку з сервером (мережа або таймаут). Перевірте інтернет, VPN чи брандмауер і спробуйте ще раз. ({e})")
+        format!("{NET_ADVICE} ({e})")
     } else {
         e.to_string()
     }
-}
-
-/// Прибирає токени з тексту, який покажемо чи запишемо в історію (сервер може ехо-ити заголовки). Токени коротші за 6
-/// символів ігноруються, щоб не псувати звичайний текст. shortcut: лише буквальний збіг (без url-кодування).
-pub fn mask_token(msg: &str, tokens: &[&str]) -> String {
-    tokens.iter().map(|t| t.trim()).filter(|t| t.chars().count() >= 6).fold(msg.to_string(), |m, t| m.replace(t, "***"))
 }
 
 /// Текст помилки з тіла відповіді API (Modrinth: description, CurseForge: errorMessage), інакше обрізане тіло.
@@ -1842,6 +1917,14 @@ pub fn restart_checked() -> Result<(), String> {
     Ok(())
 }
 
+static UPD_TOTAL: AtomicU64 = AtomicU64::new(0);
+static UPD_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// (завантажено, усього) байтів оновлення; усього = 0, якщо розмір невідомий. Для смуги прогресу в UI.
+pub fn update_progress() -> (u64, u64) {
+    (UPD_DONE.load(Relaxed), UPD_TOTAL.load(Relaxed))
+}
+
 fn download_to(url: &str, dest: &Path, size: u64) -> Result<(), String> {
     use std::io::{Read, Write};
     let c = client_open(900)?;
@@ -1849,9 +1932,20 @@ fn download_to(url: &str, dest: &Path, size: u64) -> Result<(), String> {
     if !resp.status().is_success() {
         return Err(format!("Сервер відповів {}", resp.status()));
     }
+    UPD_TOTAL.store(if size > 0 { size } else { resp.content_length().unwrap_or(0) }, Relaxed);
+    UPD_DONE.store(0, Relaxed);
     let res = (|| {
         let mut out = std::fs::File::create(dest).map_err(|e| format!("Не вдалося записати файл оновлення поруч із програмою: {e}"))?;
-        let n = std::io::copy(&mut resp.take(UPDATE_MAX + 1), &mut out).map_err(|e| e.to_string())?;
+        let (mut src, mut buf, mut n) = (resp.take(UPDATE_MAX + 1), vec![0u8; 64 * 1024], 0u64);
+        loop {
+            let k = src.read(&mut buf).map_err(|e| e.to_string())?;
+            if k == 0 {
+                break;
+            }
+            out.write_all(&buf[..k]).map_err(|e| e.to_string())?;
+            n += k as u64;
+            UPD_DONE.store(n, Relaxed);
+        }
         out.flush().map_err(|e| e.to_string())?;
         if n > UPDATE_MAX {
             return Err("Файл оновлення завеликий".to_string());
@@ -2587,6 +2681,10 @@ mod tests {
     fn secrets_are_masked_in_errors() {
         assert_eq!(mask_secrets("bad token mrp_SECRET123 here", &["mrp_SECRET123"]), "bad token ••• here");
         assert_eq!(mask_secrets("x", &["", "ab"]), "x", "порожні й короткі не чіпаємо");
+        let t = "mrp_SECRETSECRET123";
+        let m = mask_secrets(&format!("HTTP 401: Authorization: {t} (also {t})"), &[t, "", " ab "]);
+        assert!(!m.contains("SECRET") && m.matches("•••").count() == 2, "{m}");
+        assert_eq!(mask_secrets("tok123456 x", &["  tok123456\n"]), "••• x", "пробіли з вставки обрізаються");
         // сервер ехо-повертає токен у повідомленні: після masked його немає
         let (r, _) = with_mock(1, vec![("GET /v2/user", 400, r#"{"description":"invalid header Authorization: mrp_SECRET123"}"#)], || masked(modrinth_token_check("mrp_SECRET123"), &["mrp_SECRET123"]));
         let e = r.unwrap_err();
@@ -2669,6 +2767,89 @@ mod tests {
         let bak = std::fs::read_dir(&d).unwrap().filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().ends_with(".bak"));
         assert!(bak, "зіпсований файл збережено поруч");
         assert!(!p.exists() || serde_json::from_str::<Config>(&std::fs::read_to_string(&p).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn history_context_restore_and_old_rows() {
+        let d = tmp_dir("histctx");
+        let p = d.join("history.jsonl");
+        // старий рядок без нових полів
+        std::fs::write(&p, "{\"t\":1,\"project\":\"Old\",\"number\":\"0.9\",\"platform\":\"Modrinth\",\"ok\":true,\"msg\":\"x\"}\n").unwrap();
+        let ctx = HistCtx { project_id: "p7".into(), name: "Моя версія".into(), release_type: "beta".into(), mc_versions: "1.20.1, 1.20.2".into(), loaders: vec!["fabric".into(), "quilt".into()] };
+        history_add_with(&p, "New", "1.0", "Modrinth", &Ok("v".into()), &ctx);
+        let h = history_load_at(&p, 10);
+        assert_eq!(h.len(), 2);
+        let r = restore_from_history(&h[0]).unwrap();
+        assert_eq!((r.draft.project.as_str(), r.draft.number.as_str(), r.draft.name.as_str()), ("p7", "1.0", "Моя версія"));
+        assert_eq!((r.release_type.as_str(), r.mc_versions.as_str(), r.loaders.len()), ("beta", "1.20.1, 1.20.2", 2));
+        let old = restore_from_history(&h[1]).unwrap();
+        assert_eq!((old.draft.project.as_str(), old.draft.number.as_str(), old.release_type.as_str()), ("", "0.9", ""));
+        assert!(restore_from_history(&json!({"project": "x"})).is_none());
+        // без контексту нові ключі в рядок не потрапляють
+        let p2 = d.join("h2.jsonl");
+        history_add_at(&p2, "A", "1", "Modrinth", &Ok("k".into()));
+        assert!(!std::fs::read_to_string(&p2).unwrap().contains("pid"));
+        assert!(history_filter(&h, "моя версія", false).len() == 1, "пошук за назвою версії");
+    }
+
+    #[test]
+    fn history_filter_fast_and_export_all_streams_whole_file() {
+        let d = tmp_dir("histbig");
+        let p = d.join("history.jsonl");
+        let mut text = String::new();
+        for i in 0..5000u64 {
+            let (ok, msg) = if i % 7 == 0 { (false, "помилка мережі") } else { (true, "версія ok") };
+            text += &format!("{}\n", json!({"t": 1_700_000_000 + i, "project": format!("Mod{}", i % 40), "number": format!("1.{i}"), "platform": "Modrinth", "ok": ok, "msg": msg}));
+        }
+        text += "не json\n";
+        std::fs::write(&p, &text).unwrap();
+        let all: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let t0 = std::time::Instant::now();
+        let hits = history_filter(&all, "mod7", false).len();
+        let fails = history_filter(&all, "", true).len();
+        assert!(t0.elapsed() < Duration::from_secs(2), "фільтр 5000 записів: {:?}", t0.elapsed());
+        assert_eq!((hits, fails), (125, 715));
+        // «експорт усіх»: файл читається потоково, а не лише хвіст із 300 записів
+        let out = d.join("all.csv");
+        let n = history_export_at(&p, &out).unwrap();
+        assert_eq!(n, 5000, "пошкоджений рядок пропущено");
+        let csv = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(csv.lines().count(), 5001);
+        assert!(csv.lines().nth(1).unwrap().contains("\"Mod0\",\"1.0\","), "від старих до нових");
+        // відсутній файл історії: лише заголовок
+        assert_eq!(history_export_at(&d.join("none.jsonl"), &d.join("e.csv")).unwrap(), 0);
+    }
+
+    #[test]
+    fn update_download_reports_progress_and_checks_size() {
+        let body: &'static str = Box::leak("x".repeat(300).into_boxed_str());
+        let d = tmp_dir("updprog");
+        let dest = d.join("new.exe");
+        let (r, _) = with_mock(1, vec![("GET /file", 200, body)], || {
+            let url = format!("{}/file", TEST_BASE.lock().unwrap().clone().unwrap());
+            download_to(&url, &dest, 300)
+        });
+        assert!(r.is_ok());
+        assert_eq!(update_progress(), (300, 300));
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 300);
+        // розмір не збігається з метаданими: файл видаляється
+        let (r, _) = with_mock(1, vec![("GET /file", 200, body)], || {
+            let url = format!("{}/file", TEST_BASE.lock().unwrap().clone().unwrap());
+            download_to(&url, &dest, 999)
+        });
+        assert!(r.unwrap_err().contains("не повністю") && !dest.exists());
+    }
+
+    #[test]
+    fn every_error_code_has_advice() {
+        let advice = ["Перевірте", "Створіть", "Зачекайте", "Змініть", "Оберіть", "Повторіть", "повторіть", "спробуйте"];
+        for code in [400u16, 401, 403, 404, 408, 409, 413, 418, 422, 429, 500, 502, 503, 504, 599] {
+            let m = human(reqwest::StatusCode::from_u16(code).unwrap());
+            assert!(advice.iter().any(|a| m.contains(a)), "{code}: «{m}» без поради");
+            assert!(m.chars().count() > 30, "{code}: надто коротко");
+        }
+        // і мережева помилка підказує, що робити
+        assert!(NET_ADVICE.contains("Перевірте інтернет"));
     }
 
     #[test]
@@ -3359,15 +3540,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&f).unwrap().lines().count(), 2, "повтор Modrinth не записано, CurseForge записано");
     }
 
-    #[test]
-    fn tokens_are_masked_in_messages() {
-        let t = "mrp_SECRETSECRET123";
-        let m = mask_token(&format!("HTTP 401: bad header Authorization: {t} (also {t})"), &[t, "", " short "]);
-        assert!(!m.contains("SECRET") && m.matches("***").count() == 2, "{m}");
-        assert_eq!(mask_token("нічого", &["abc"]), "нічого", "короткі токени не маскуємо");
-        assert_eq!(mask_token("tok123456 x", &["  tok123456\n"]), "*** x", "пробіли з вставки обрізаються");
-    }
-
     #[cfg(windows)]
     #[test]
     fn locked_files_give_clear_messages_on_windows() {
@@ -3393,5 +3565,42 @@ mod tests {
             assert!(e.contains("Не вдалося замінити програму"), "{e}");
             assert_eq!(std::fs::read(&exe).unwrap(), b"v1-running");
         }
+    }
+
+    #[test]
+    fn history_survives_odd_files_and_old_rows() {
+        let d = tmp_dir("hist_odd");
+        let p = d.join("history.jsonl");
+        // немає файлу, порожній файл, один рядок
+        assert!(history_load_at(&p, 10).is_empty());
+        std::fs::write(&p, "").unwrap();
+        assert!(history_load_at(&p, 10).is_empty());
+        std::fs::write(&p, "{\"t\":1,\"project\":\"A\"}\n").unwrap();
+        assert_eq!(history_load_at(&p, 10).len(), 1, "старий рядок без нових полів читається");
+        // битий JSON, порожні рядки, сміття і зворотна сумісність (рядки без ok/msg/t) не ламають решту
+        std::fs::write(&p, "{\"t\":1,\"project\":\"A\",\"ok\":true,\"msg\":\"x\"}\n{broken\n\n\u{0}\u{0}\n[1,2]\n\"str\"\n{\"project\":\"B\"}\n").unwrap();
+        let h = history_load_at(&p, 10);
+        let names: Vec<&str> = h.iter().filter_map(|e| e["project"].as_str()).collect();
+        assert_eq!(names, ["B", "A"], "новіші першими, непарсовані пропущені");
+        // фільтри й CSV на рядках без полів: без паніки
+        assert_eq!(history_filter(&h, "b", false).len(), 1);
+        assert_eq!(history_filter(&h, "", true).len(), 1, "без ok це не успіх");
+        assert!(history_link(&h[0]).is_none());
+        let csv = history_csv(&h);
+        assert!(csv.starts_with('\u{feff}') && csv.lines().count() == 3, "{csv}");
+        assert_eq!(history_csv(&[]).lines().count(), 1, "порожня історія: лише заголовок");
+        // межа вікна всередині багатобайтового символа та рядок довший за вікно
+        let line = format!("{{\"t\":2,\"project\":\"{}\",\"ok\":true,\"msg\":\"{}\"}}\n", "Я", "ї".repeat(1000));
+        let mut body = String::new();
+        for _ in 0..400 {
+            body += &line;
+        }
+        std::fs::write(&p, &body).unwrap();
+        let h = history_load_at(&p, 5);
+        assert!(!h.is_empty() && h.len() <= 5 && h.iter().all(|e| e["project"] == "Я"));
+        let huge = format!("{{\"t\":3,\"project\":\"OK\"}}\n{{\"t\":4,\"msg\":\"{}\"}}\n", "z".repeat(400_000));
+        std::fs::write(&p, huge).unwrap();
+        let h = history_load_at(&p, 5);
+        assert!(h.len() <= 2, "надвеликий хвостовий рядок обрізається вікном і пропускається");
     }
 }
