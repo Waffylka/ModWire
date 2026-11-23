@@ -70,6 +70,7 @@ enum Msg {
     Found(Option<usize>, Result<Box<Project>, String>), // проєкт знайдено за посиланням/slug
     Done(P, Result<String, String>),
     File(PathBuf),
+    ExtraFile(PathBuf), // додатковий файл версії (Modrinth)
     Changelog(String),
     Notice(String),
     Imported(Vec<Project>),
@@ -91,6 +92,9 @@ struct App {
     mr_loading: bool,
     mr_msg: String, // помилка завантаження списку Modrinth, показується під кнопкою
     cf_id: String,
+    featured: bool,                  // Modrinth: рекомендована версія
+    send_deps: bool,                 // Modrinth: надсилати залежності з файлу
+    extra_files: Vec<PathBuf>,       // Modrinth: додаткові файли (до MAX_EXTRA)
     mr_link: String,                 // посилання або slug Modrinth у діалозі додавання
     sel_mode: bool,                  // режим вибору для пакетного видалення
     picked: std::collections::HashSet<String>, // id вибраних проєктів
@@ -147,6 +151,8 @@ struct App {
     cf_msg: Chk,
     key_msg: Chk,
     open_steps: [bool; 6], // розгорнуті кроки публікації (згортає лише користувач)
+    confirm_close: bool,  // показано діалог «Публікація триває»
+    close_ok: bool,       // користувач підтвердив вихід під час публікації
     draft_at: Option<std::time::Instant>, // коли змінилась чернетка форми (запис на диск із затримкою)
     merge_hidden: bool, // діалог «Однакова назва» закрито Esc без рішення
     add_shown: bool,
@@ -174,6 +180,11 @@ fn checked_msg(t: u64) -> Chk {
 }
 
 /// « · 2.5 МБ/с · ще ~8 с» для рядка прогресу завантаження.
+/// Закриття вікна треба підтвердити, якщо йде публікація і вихід ще не підтверджено.
+fn must_ask_close(requested: bool, pending: u8, confirmed: bool) -> bool {
+    requested && pending > 0 && !confirmed
+}
+
 fn speed_text(bps: u64, eta: u64) -> String {
     format!(" · {:.1} МБ/с · ще ~{} с", bps as f64 / 1_048_576.0, eta)
 }
@@ -234,6 +245,14 @@ fn pick_file(dir: String) -> Option<Msg> {
         d = d.set_directory(dir);
     }
     d.pick_file().map(Msg::File)
+}
+
+fn pick_extra(dir: String) -> Option<Msg> {
+    let mut d = rfd::FileDialog::new().add_filter("Додатковий файл (sources, dev-jar)", &["jar", "zip"]);
+    if !dir.is_empty() {
+        d = d.set_directory(dir);
+    }
+    d.pick_file().map(Msg::ExtraFile)
 }
 
 fn setup_style(ctx: &egui::Context) {
@@ -496,7 +515,7 @@ fn step(ui: &mut egui::Ui, spec: StepSpec, open: &mut bool, f: impl FnOnce(&mut 
                     if ghost_btn(ui, None, "Змінити").clicked() {
                         *open = true;
                     }
-                } else if done && ghost_btn(ui, Some(Ic::Chevron), "Згорнути").clicked() {
+                } else if done && icon_only(ui, Ic::ChevronUp, "Згорнути крок", false).clicked() {
                     *open = false;
                 }
             });
@@ -575,7 +594,6 @@ enum Kind {
     Info,
     Warn,
     Error,
-    Ok,
 }
 
 /// Єдине повідомлення: смуга 3px зліва, значок і текст; відступи 12/8.
@@ -584,7 +602,6 @@ fn banner(ui: &mut egui::Ui, kind: Kind, text: &str) {
         Kind::Info => (MUTED, Ic::Info),
         Kind::Warn => (WARN, Ic::Warn),
         Kind::Error => (ERROR, Ic::Cross),
-        Kind::Ok => (SUCCESS, Ic::Check),
     };
     let fill = if kind == Kind::Info { FIELD } else { col.gamma_multiply(0.12) };
     // поява за 150 мс: прозорість росте від 0 на першому кадрі
@@ -696,7 +713,7 @@ fn choice_col(ui: &mut egui::Ui, on: bool, label: &str, col: Color32, alpha: f32
 
 /// Чип версії Minecraft: нижчий (28) і дрібніший (13).
 fn mc_chip(ui: &mut egui::Ui, on: bool, label: &str) -> egui::Response {
-    choice_sz(ui, on, label, ACCENT, 0.20, 28.0, egui::FontId::proportional(13.0))
+    choice_sz(ui, on, label, ACCENT, 0.20, 36.0, egui::TextStyle::Button.resolve(ui.style()))
 }
 
 fn choice_sz(ui: &mut egui::Ui, on: bool, label: &str, col: Color32, alpha: f32, h: f32, font: egui::FontId) -> egui::Response {
@@ -823,7 +840,7 @@ impl App {
         let rt = RELEASE_TYPES.iter().position(|r| *r == l.release_type).unwrap_or(0);
         let mut app = Self {
             tab: Tab::Projects, tx, rx, add_open: false, target: None, mr_list: vec![], mr_loading: false, mr_msg: String::new(),
-            cf_id: String::new(), mr_link: String::new(), sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), sel, file: None,
+            cf_id: String::new(), featured: false, send_deps: false, extra_files: vec![], mr_link: String::new(), sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), sel, file: None,
             name: String::new(), number: sel.and_then(|i| cfg.projects.get(i)).map(|p| bump(&p.last_number)).unwrap_or_default(), release_type: rt, changelog: String::new(),
             use_mr: true, use_cf: true, mr_res: None, cf_res: None, pending: 0, msg: String::new(),
             show_tokens: false, confirm_del: None, confirm_clear: false, check_msg: checked_msg(cfg.modrinth_checked), up_mr: Up::default(), up_cf: Up::default(), cur_cl: String::new(), cur_meta: Default::default(),
@@ -834,7 +851,7 @@ impl App {
                 Load::Recovered =>"Конфіг було пошкоджено: копію збережено в теці конфігу (файл .bak), налаштування скинуто.".into(),
                 Load::ReadOnly => "Не вдалося прочитати конфіг: збереження вимкнено, щоб не перезаписати старі дані. Закрийте програми, що тримають файл, і перезапустіть.".into(),
             },
-            readonly: matches!(state, Load::ReadOnly), adding: 0, cf_auto_off: false, cur_idx: None, history: history_load(HIST_MAX), hist_q: String::new(), hist_fail: false, hist_all: false, hist_confirm: false, cur: Default::default(), mc_known: vec![], mc_all: vec![], mc_loading: false, mc_next: None, cf_msg: checked_msg(cfg.curse_checked), key_msg: checked_msg(cfg.core_checked), merge_hidden: false, add_shown: false, file_note: String::new(), splash: splash::Splash::new(), brand_rect: None, file_info: None, focus_step: None, focus_hist: false, proj_q: String::new(), open_steps: [true; 6], draft_at: None, cfg,
+            readonly: matches!(state, Load::ReadOnly), adding: 0, cf_auto_off: false, cur_idx: None, history: history_load(HIST_MAX), hist_q: String::new(), hist_fail: false, hist_all: false, hist_confirm: false, cur: Default::default(), mc_known: vec![], mc_all: vec![], mc_loading: false, mc_next: None, cf_msg: checked_msg(cfg.curse_checked), key_msg: checked_msg(cfg.core_checked), merge_hidden: false, add_shown: false, file_note: String::new(), splash: splash::Splash::new(), brand_rect: None, file_info: None, focus_step: None, focus_hist: false, proj_q: String::new(), open_steps: [true; 6], confirm_close: false, close_ok: false, draft_at: None, cfg,
         };
         app.restore_draft();
         app
@@ -858,6 +875,9 @@ impl App {
             }
         }
         (self.name, self.changelog) = (d.name, d.changelog);
+        if self.notice.is_empty() && (self.file.is_some() || !self.number.trim().is_empty() && self.number != self.sel.and_then(|i| self.cfg.projects.get(i)).map(|p| bump(&p.last_number)).unwrap_or_default() || !self.changelog.trim().is_empty()) {
+            self.notice = "Відновлено чернетку з минулого запуску.".into();
+        }
     }
 
     /// Тримає чернетку в конфігу актуальною; на диск пише через 1,5 с після останньої правки (не на кожну літеру).
@@ -918,6 +938,7 @@ impl App {
             (self.use_cf, self.cf_auto_off) = (true, false);
         }
         self.file_note.clear();
+        self.send_deps = false; // залежності нового файлу користувач підтверджує заново
         self.file_info = read_jar(&f);
         if let Some(i) = self.file_info.clone() {
             if let Some(v) = i.version.clone() {
@@ -1041,6 +1062,11 @@ impl App {
                     }
                 }
                 Msg::File(f) => self.set_file(f),
+                Msg::ExtraFile(f) => {
+                    if self.extra_files.len() < MAX_EXTRA && !self.extra_files.contains(&f) {
+                        self.extra_files.push(f);
+                    }
+                }
                 Msg::Changelog(t) => self.changelog = t,
                 Msg::Notice(t) => self.notice = t,
                 Msg::Update(r, manual) => {
@@ -1106,6 +1132,36 @@ impl App {
         }
     }
 
+    /// Діалог при закритті вікна під час публікації: лишитись або перервати й вийти.
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_close {
+            return;
+        }
+        let (mut stay, mut quit) = (false, false);
+        let r = egui::Modal::new(egui::Id::unique("close_dialog")).backdrop_color(Color32::from_black_alpha(160)).frame(modal_frame()).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(title("Публікація триває"));
+            ui.add_space(8.0);
+            ui.label("Файл ще надсилається. Якщо закрити програму зараз, публікацію буде перервано, а версія могла частково з'явитись на сайті.");
+            hint(ui, "Після виходу перевірте результат на сторінці проєкту.");
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if ui.add(primary("Лишитись")).clicked() { stay = true; }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(danger("Перервати й вийти")).clicked() { quit = true; }
+                });
+            });
+        });
+        if quit {
+            self.up_mr.cancel.store(true, Relaxed);
+            self.up_cf.cancel.store(true, Relaxed);
+            self.close_ok = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if stay || r.should_close() {
+            self.confirm_close = false;
+        }
+    }
+
     /// Змінює обраний проєкт і скидає стан попередньої публікації.
     fn select_project(&mut self, i: Option<usize>) {
         if self.sel != i {
@@ -1139,7 +1195,7 @@ impl App {
     fn remove_project(&mut self, i: usize) {
         self.confirm_del = None;
         self.cfg.projects.remove(i);
-        let shift = |o: Option<usize>| match o { Some(s) if s == i => None, Some(s) if s > i => Some(s - 1), o => o };
+        let shift = |o: Option<usize>| match o { Some(s) if s == i => None, Some(s) if s > i && s != usize::MAX => Some(s - 1), o => o }; // MAX = маркер «немає», не зсуваємо
         let new_sel = shift(self.sel);
         if self.sel == Some(i) {
             self.sel = Some(usize::MAX); // видалений: його форму не можна записати в чужу чернетку
@@ -1151,7 +1207,9 @@ impl App {
         }
         self.target = shift(self.target);
         self.cur_idx = shift(self.cur_idx); // публікація в процесі: індекс не має вказувати на чужий проєкт
-        self.cfg.last.project = shift(Some(self.cfg.last.project)).unwrap_or(usize::MAX);
+        if self.cfg.last.project != usize::MAX {
+            self.cfg.last.project = shift(Some(self.cfg.last.project)).unwrap_or(usize::MAX); // MAX = «немає проєкту», його не зсуваємо
+        }
         self.save();
     }
 
@@ -1560,7 +1618,7 @@ impl App {
                                             if ui.add(danger("Точно видалити?")).clicked() { delete = Some(i); }
                                             if ghost_btn(ui, Some(Ic::Cross), "Скасувати").clicked() { cancel = true; }
                                         } else {
-                                            if icon_only(ui, Ic::File, "Дублювати проєкт: копія з тими самими налаштуваннями", false).clicked() { dup = Some(i); }
+                                            if icon_only(ui, Ic::Copy, "Дублювати проєкт: копія з тими самими налаштуваннями", false).clicked() { dup = Some(i); }
                                             if icon_only(ui, Ic::Pin, if p.pinned { "Відкріпити" } else { "Закріпити: закріплені проєкти йдуть першими" }, p.pinned).clicked() { pin = Some(i); }
                                             if ui.add_enabled_ui(self.pending == 0 && self.adding == 0, |ui| icon_only(ui, Ic::Trash, "Видалити запис у Modwire", false)).inner.on_disabled_hover_text("Недоступно, поки триває публікація або додавання").clicked() {
                                                 ask = Some(i);
@@ -1679,6 +1737,12 @@ impl App {
                     if !self.mr_link.trim().is_empty() && slug.is_none() {
                         field_error(ui, &lr, "Вставте посилання modrinth.com/mod/… або slug");
                     }
+                    if just_opened {
+                        lr.request_focus(); // перше поле діалогу
+                    }
+                    if self.mr_link.trim().is_empty() {
+                        hint(ui, "Вставте адресу сторінки мода й натисніть Enter, або оберіть зі списку нижче.");
+                    }
                     let enter = lr.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if let Some(slug) = slug && (ui.add_enabled_ui(true, |ui| ghost_btn(ui, Some(Ic::Plus), "Додати за посиланням")).inner.clicked() || enter) {
                         let (t, target) = (self.cfg.modrinth_token.trim().to_string(), self.target);
@@ -1758,11 +1822,8 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(title("CurseForge").color(CF_COL));
                     });
-                    let lid = field_label(ui, "ID проєкту *");
-                    let idr = ui.add(egui::TextEdit::singleline(&mut self.cf_id).hint_text("наприклад, 123456").desired_width(f32::INFINITY)).labelled_by(lid);
-                    if just_opened {
-                        idr.request_focus();
-                    }
+                    let lid = field_label(ui, "ID або посилання *");
+                    let idr = ui.add(egui::TextEdit::singleline(&mut self.cf_id).hint_text("123456 або curseforge.com/minecraft/mc-mods/назва").desired_width(f32::INFINITY)).labelled_by(lid);
                     let cf_link = parse_project_link(&self.cf_id);
                     if !self.cf_id.trim().is_empty() && !self.cf_id.trim().chars().all(|c| c.is_ascii_digit()) && cf_link.is_none() {
                         field_error(ui, &idr, "Лише цифри або посилання curseforge.com");
@@ -1772,7 +1833,7 @@ impl App {
                     let key =self.cfg.curse_core_key.trim().to_string();
                     let can_add = id_ok;
                     let enter = idr.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.add_enabled(can_add, primary("Додати з CurseForge").min_size(egui::vec2(ui.available_width(), 34.0))).on_disabled_hover_text("Введіть числовий ID проєкту").clicked() || (can_add && enter) {
+                    if ui.add_enabled(can_add, primary("Додати з CurseForge").min_size(egui::vec2(ui.available_width(), 34.0))).on_disabled_hover_text("Введіть ID проєкту або посилання curseforge.com").clicked() || (can_add && enter) {
                         self.cf_id = self.cf_id.trim().to_string();
                         if let Some(Link::CurseId(id)) = parse_project_link(&self.cf_id) {
                             self.cf_id = id;
@@ -1829,6 +1890,10 @@ impl App {
             loaders: self.cfg.last.loaders.clone(),
             release_type: RELEASE_TYPES[self.release_type].into(),
             changelog: self.changelog.clone(),
+            featured: self.featured,
+            dep_slugs: if self.send_deps { self.file_info.as_ref().map(|i| i.deps.clone()).unwrap_or_default() } else { vec![] },
+            extra_files: self.extra_files.clone(),
+            dep_ids: vec![],
         };
         // порожня «Назва» + шаблон проєкту = назва за шаблоном
         if r.name.trim().is_empty() && let Some(p) = self.sel.and_then(|i| self.cfg.projects.get(i)).filter(|p| !p.name_template.trim().is_empty()) {
@@ -2106,18 +2171,11 @@ impl App {
             });
 
             step(ui, sp(3, "Сумісність", true), &mut open[3], |ui| {
-                if ui.available_width() >= 480.0 {
-                    ui.columns(2, |c| {
-                        self.mc_ui(&mut c[0], focus == Some(3));
-                        self.mc_chips(&mut c[0]); // чипи під полем, до якого належать
-                        self.loaders_ui(&mut c[1]);
-                    });
-                } else {
-                    self.mc_ui(ui, focus == Some(3));
-                    self.mc_chips(ui);
-                    ui.add_space(8.0);
-                    self.loaders_ui(ui);
-                }
+                // усе в одну колонку: чотири лоадери вміщуються в рядок без переносу
+                self.mc_ui(ui, focus == Some(3));
+                self.mc_chips(ui);
+                ui.add_space(8.0);
+                self.loaders_ui(ui);
             });
 
             step(ui, sp(4, "Зміни", false), &mut open[4], |ui| {
@@ -2184,6 +2242,35 @@ impl App {
                         }
                     }
                 }
+                if has_mr && self.use_mr {
+                    // додаткові можливості лише для Modrinth; усе вимкнено за замовчуванням
+                    ui.add_space(8.0);
+                    field_label(ui, "Modrinth: додатково");
+                    ui.checkbox(&mut self.featured, "Позначити як рекомендовану");
+                    let deps = self.file_info.as_ref().map(|i| i.deps.clone()).unwrap_or_default();
+                    if !deps.is_empty() {
+                        ui.checkbox(&mut self.send_deps, format!("Надіслати залежності: {}", deps.join(", "))).on_hover_text("Зіставляються з проєктами Modrinth за slug; ненайдені пропускаються. Позначаються як обов'язкові.");
+                    }
+                    let mut rm = None;
+                    for (k, p) in self.extra_files.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).color(MUTED));
+                            if ghost_btn(ui, Some(Ic::Cross), "Прибрати").clicked() {
+                                rm = Some(k);
+                            }
+                        });
+                    }
+                    if let Some(k) = rm {
+                        self.extra_files.remove(k);
+                    }
+                    if self.extra_files.len() < MAX_EXTRA && ghost_btn(ui, Some(Ic::Plus), "Додатковий файл…").on_hover_text("Наприклад, sources або dev-jar (до 3). Лише Modrinth").clicked() {
+                        let d = self.cfg.last.dir.clone();
+                        self.spawn_opt(ctx, move || pick_extra(d));
+                    }
+                    if self.use_cf && !self.extra_files.is_empty() {
+                        hint(ui, "CurseForge отримає лише основний файл.");
+                    }
+                }
             });
 
             self.publish_extras(ui);
@@ -2221,10 +2308,13 @@ impl App {
             egui::ScrollArea::vertical().id_salt("pub_res").max_height((ctx.content_rect().height() * 0.24).clamp(90.0, 220.0)).auto_shrink([false, true]).show(ui, |ui| {
                 for (name, f, col, extra) in &bars {
                     // підпис над смугою: довжина тексту не зсуває початок смуги, обидві платформи вирівняні
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
-                        ui.label(RichText::new(format!("{name}: {}%{extra}", (f * 100.0) as u32)).color(MUTED).size(HINT_SZ));
-                        ui.add(egui::ProgressBar::new(*f).desired_height(8.0).desired_width(ui.available_width()).fill(*col).corner_radius(4).animate(false));
+                    // рядок: назва · смуга · відсоток і швидкість (фіксована колонка назви: смуги вирівняні)
+                    ui.horizontal(|ui| {
+                        ui.add_sized([90.0, 20.0], egui::Label::new(RichText::new(*name).color(TEXT)));
+                        let tail = if ui.available_width() > 420.0 { 170.0 } else { 56.0 };
+                        ui.add(egui::ProgressBar::new(*f).desired_height(8.0).desired_width((ui.available_width() - tail - 8.0).max(60.0)).fill(*col).corner_radius(4).animate(false));
+                        let txt = if tail > 100.0 { format!("{}%{extra}", (f * 100.0) as u32) } else { format!("{}%", (f * 100.0) as u32) };
+                        ui.label(RichText::new(txt).color(MUTED).size(HINT_SZ));
                     });
                 }
                 if !self.msg.is_empty() {
@@ -2233,22 +2323,35 @@ impl App {
                 for (name, r) in [("Modrinth", &self.mr_res), ("CurseForge", &self.cf_res)] {
                     match r {
                         Some(Ok(s)) => {
-                            let (txt, url) = split_url(s);
-                            banner(ui, Kind::Ok, &format!("{name}: опубліковано. {txt}"));
-                            if let Some(u) = url {
-                                ui.horizontal_wrapped(|ui| {
-                                    if icon_btn(ui, Some(Ic::External), "Відкрити на сайті", false).clicked() {
+                            let (_, url) = split_url(s);
+                            ui.horizontal_wrapped(|ui| {
+                                icon_label_c(ui, Ic::Check, SUCCESS, &format!("{name}: опубліковано"), TEXT);
+                                if let Some(u) = url {
+                                    if icon_btn(ui, Some(Ic::External), "Відкрити", false).clicked() {
                                         ui.ctx().open_url(egui::OpenUrl::new_tab(u.clone()));
                                     }
                                     if ghost_btn(ui, None, "Копіювати посилання").clicked() {
                                         ui.ctx().copy_text(u);
                                         self.notice = "Посилання скопійовано.".into();
                                     }
-                                });
-                            }
+                                }
+                            });
                         }
                         Some(Err(e)) => {
-                            banner(ui, Kind::Error, &format!("{name}: не вдалося опублікувати. {e}"));
+                            // коротко в рядку, повний текст за «Докладніше»
+                            let short: String = e.split(". ").next().unwrap_or(e).chars().take(90).collect();
+                            let long = short.chars().count() < e.chars().count();
+                            let det_id = egui::Id::NULL.with(("res_detail", name));
+                            let open = ctx.data_mut(|d| d.get_temp::<bool>(det_id)).unwrap_or(false);
+                            ui.horizontal_wrapped(|ui| {
+                                icon_label_c(ui, Ic::Cross, ERROR, &format!("{name}: помилка. {short}{}", if long { "…" } else { "" }), TEXT);
+                                if long && ghost_btn(ui, None, if open { "Сховати" } else { "Докладніше" }).clicked() {
+                                    ctx.data_mut(|d| d.insert_temp(det_id, !open));
+                                }
+                            });
+                            if open {
+                                hint(ui, e);
+                            }
                             if e.contains("перевірте на сайті") {
                                 // запит міг дійти до сервера: даємо посилання й попереджаємо про дубль
                                 hint(ui, "Файл міг уже потрапити на сайт. Перевірте список версій, перш ніж публікувати повторно, щоб не було дубля.");
@@ -2263,7 +2366,7 @@ impl App {
                     }
                 }
                 if !busy && any_err {
-                    hint(ui, if any_ok { "Частина платформ уже прийняла версію. Кнопка «Повторити» нижче надішле файл лише туди, де не вдалося, дублів не буде." } else { "Виправте причину й натисніть «Повторити»: введені дані збережено." });
+                    hint(ui, if any_ok { "«Повторити» надішле файл лише туди, де не вдалося: дублів не буде." } else { "Виправте причину й натисніть «Повторити»: введені дані збережено." });
                 }
                 if !busy && any_ok {
                     ui.horizontal(|ui| {
@@ -2279,6 +2382,7 @@ impl App {
                 self.number = self.sel.and_then(|i| self.cfg.projects.get(i)).map(|p| bump(&p.last_number)).unwrap_or_default();
                 (self.use_mr, self.use_cf, self.mr_res, self.cf_res) = (true, true, None, None);
                 (self.file_info, self.file_note) = (None, String::new());
+                (self.extra_files, self.send_deps) = (vec![], false);
                 self.msg.clear();
             }
             ui.add_space(8.0);
@@ -2332,10 +2436,15 @@ impl App {
                     let p = self.sel.and_then(|i| self.cfg.projects.get(i));
                     // після часткового успіху показуємо лише платформи, куди ще надсилатимемо
                     let (mr_left, cf_left) = (mr && !matches!(self.mr_res, Some(Ok(_))), cf && !matches!(self.cf_res, Some(Ok(_))));
+                    let (mr0, cf0) = (mr, cf);
                     let (mr, cf) = if mr_left || cf_left { (mr_left, cf_left) } else { (mr, cf) };
                     let to = match (mr, cf) { (true, true) => "Modrinth і CurseForge", (true, false) => "Modrinth", _ => "CurseForge" };
                     let txt = p.map_or_else(String::new, |p| format!("{} {} → {}", p.name, self.number.trim(), to));
                     icon_label_c(ui, Ic::Check, SUCCESS, &txt, SUCCESS);
+                    if let Some(p) = p {
+                        let full = release_summary(&p.name, &self.release(), mr0, cf0);
+                        ui.add(egui::Label::new(RichText::new(&full).color(MUTED).size(HINT_SZ)).truncate()).on_hover_text(full);
+                    }
                 }
                 Err(e) => {
                     ui.label(RichText::new(format!("Крок {cur} з 6")).color(MUTED).size(HINT_SZ));
@@ -2389,7 +2498,7 @@ impl App {
                     }
                     let avail = ui.available_width();
                     let narrow = avail < 560.0;
-                    egui::Grid::new("history_grid").num_columns(if narrow { 2 } else { 4 }).spacing([16.0, 8.0]).min_col_width(60.0).show(ui, |ui| {
+                    egui::Grid::new("history_grid").num_columns(if narrow { 2 } else { 4 }).spacing([16.0, 14.0]).min_col_width(60.0).show(ui, |ui| {
                         ui.spacing_mut().interact_size.y = 22.0; // комірки рядка вирівнюються по верху, без зсуву від висоти кнопки
                         for e in found.iter().take(limit) {
                             let ok = e["ok"].as_bool().unwrap_or(false);
@@ -2433,9 +2542,9 @@ impl App {
                                 }).response
                             };
                             ui.end_row();
-                            let y = r.rect.bottom() + 4.0;
+                            let y = r.rect.bottom() + 7.0;
                             // підсвітка рядка під курсором (тонка, поверх тексту не заважає)
-                            let row = egui::Rect::from_min_max(egui::pos2(ui.min_rect().left(), r.rect.top() - 4.0), egui::pos2(ui.max_rect().right(), y));
+                            let row = egui::Rect::from_min_max(egui::pos2(ui.min_rect().left(), r.rect.top() - 7.0), egui::pos2(ui.max_rect().right(), y));
                             if ui.rect_contains_pointer(row) {
                                 ui.painter().rect_filled(row, 4, ACCENT.gamma_multiply(0.06));
                             }
@@ -2725,6 +2834,8 @@ enum Ic {
     Grid,
     File,
     Chevron,
+    ChevronUp,
+    Copy,
     Refresh,
     Pin,
 }
@@ -2798,6 +2909,12 @@ fn draw_icon(p: &egui::Painter, c: egui::Pos2, kind: Ic, size: f32, col: Color32
             line(&[(-0.3, 0.5), (0.4, 0.5)]);
         }
         Ic::Chevron => line(&[(-0.6, -0.25), (0.0, 0.35), (0.6, -0.25)]),
+        Ic::ChevronUp => line(&[(-0.6, 0.25), (0.0, -0.35), (0.6, 0.25)]),
+        Ic::Copy => {
+            // два аркуші: задній показано кутом, передній — повним контуром
+            line(&[(-0.2, -0.7), (-0.2, -0.9), (0.8, -0.9), (0.8, 0.5), (0.6, 0.5)]);
+            line(&[(-0.8, -0.5), (0.45, -0.5), (0.45, 0.9), (-0.8, 0.9), (-0.8, -0.5)]);
+        }
         Ic::Pin => {
             // кнопка-«канцелярська»: голівка, основа й голка
             line(&[(-0.4, -0.85), (0.4, -0.85)]);
@@ -2830,6 +2947,13 @@ impl eframe::App for App {
         let ctx = &ctx;
         shots::tick(self, &ctx.clone());
         self.poll();
+        if must_ask_close(ctx.input(|i| i.viewport().close_requested()), self.pending, self.close_ok) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+        if self.pending == 0 {
+            self.confirm_close = false;
+        }
         if self.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -2873,7 +2997,9 @@ impl eframe::App for App {
             }
         }
         self.sync_draft(ctx);
-        if let Some(f) = ctx.input(|i| i.raw.dropped_files.first().map(|d| d.path().to_path_buf())) {
+        // під час публікації файл не міняємо: повтор для іншої платформи надіслав би інший файл
+        let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|d| d.path().to_path_buf()));
+        if let Some(f) = dropped.filter(|_| self.pending == 0) {
             self.set_file(f);
             self.tab = Tab::Publish;
         }
@@ -2920,6 +3046,7 @@ impl eframe::App for App {
             }
         }
         self.merge_dialog(ctx);
+        self.close_dialog(ctx);
         self.splash.show(ctx, self.brand_rect);
     }
 
@@ -2960,7 +3087,7 @@ fn main() -> eframe::Result {
     // Після оновлення .old лишається ще 30 с: якщо нова копія не стартує, його можна повернути вручну.
     if std::env::args().any(|a| a == "--updated") {
         std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::thread::sleep(old_grace(true));
             cleanup_update();
         });
     } else {
@@ -2986,7 +3113,7 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_msg, guarded, guarded_opt, speed_text, split_url, Chk, Msg};
+    use super::{checked_msg, guarded, guarded_opt, must_ask_close, speed_text, split_url, App, Chk, Msg, Project};
 
     #[test]
     fn split_url_separates_link() {
@@ -3008,5 +3135,67 @@ mod tests {
         assert!(matches!(guarded_opt(|| panic!("boom")), Some(Msg::Panicked)));
         assert!(matches!(guarded(|| Msg::Notice("ok".into())), Msg::Notice(_)));
         assert!(guarded_opt(|| None).is_none());
+    }
+
+    #[test]
+    fn close_needs_confirmation_only_while_publishing() {
+        assert!(must_ask_close(true, 1, false));
+        assert!(!must_ask_close(true, 0, false), "без публікації закриваємо одразу");
+        assert!(!must_ask_close(true, 2, true), "вихід уже підтверджено");
+        assert!(!must_ask_close(false, 2, false));
+    }
+
+    /// App на тимчасовій теці даних (реальний конфіг не чіпаємо). Замок тримається до кінця тесту.
+    fn test_app(tag: &str) -> (std::sync::MutexGuard<'static, ()>, App) {
+        let g = crate::logic::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = std::env::temp_dir().join(format!("mp_app_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        // shortcut: set_var глобальний; усі тести з env беруть ENV_LOCK
+        unsafe { std::env::set_var("MODWIRE_CONFIG_DIR", &d) };
+        let mut app = App::new();
+        app.cfg.projects = ["a", "b", "c"].map(|n| Project { name: n.into(), id: format!("id-{n}"), modrinth_id: format!("m{n}"), ..Default::default() }).to_vec();
+        (g, app)
+    }
+
+    #[test]
+    fn remove_selected_project_resets_form_and_never_leaks_draft() {
+        let (_g, mut app) = test_app("rm_sel");
+        app.sel = Some(1);
+        (app.number, app.changelog, app.cur_idx) = ("7.7".into(), "текст".into(), Some(1));
+        app.remove_project(1);
+        assert_eq!(app.sel, None);
+        assert!(app.cfg.projects.iter().all(|p| p.draft.number.is_empty() && p.draft.changelog.is_empty()), "форма видаленого не потрапляє в чужу чернетку");
+        assert!(app.changelog.is_empty() && app.cur_idx.is_none());
+        assert_eq!(app.cfg.projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    #[test]
+    fn remove_earlier_project_shifts_indexes_and_keeps_input() {
+        let (_g, mut app) = test_app("rm_shift");
+        app.sel = Some(2);
+        (app.number, app.target, app.cur_idx) = ("3.1".into(), Some(2), Some(2));
+        app.remove_project(0);
+        assert_eq!((app.sel, app.target, app.cur_idx), (Some(1), Some(1), Some(1)));
+        assert_eq!(app.number, "3.1", "введене не губиться");
+        app.remove_project(1); // видаляємо обраний
+        assert_eq!(app.sel, None);
+        assert_eq!(app.cfg.last.project, usize::MAX, "маркер «немає проєкту», а не чужий індекс");
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    #[test]
+    fn select_project_stashes_and_restores_draft() {
+        let (_g, mut app) = test_app("sel");
+        app.select_project(Some(0));
+        (app.number, app.changelog) = ("9.9".into(), "чернетка".into());
+        app.select_project(Some(1));
+        assert_eq!(app.cfg.projects[0].draft.number, "9.9");
+        assert!(app.changelog.is_empty(), "changelog не переходить між проєктами");
+        app.select_project(Some(0));
+        assert_eq!((app.number.as_str(), app.changelog.as_str()), ("9.9", "чернетка"));
+        app.select_project(Some(0)); // повторний вибір нічого не міняє
+        assert_eq!(app.number, "9.9");
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
     }
 }

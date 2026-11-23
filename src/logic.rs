@@ -185,12 +185,18 @@ pub fn modrinth_slug_input(s: &str) -> Option<String> {
 
 /// (id, назва, іконка) проєкту Modrinth за slug або id; токен не обов'язковий (публічні проєкти).
 pub fn modrinth_lookup(token: &str, slug: &str) -> Result<(String, String, String), String> {
+    if !slug_ok(slug) {
+        return Err(format!("Некоректний slug «{}»", slug.chars().take(40).collect::<String>()));
+    }
     let v = mr_get(&client_t(20)?, token, &format!("/project/{slug}")).map_err(|e| if e.contains("404") { format!("Проєкт «{slug}» не знайдено на Modrinth") } else { e })?;
     Ok((v["id"].as_str().ok_or("немає id проєкту")?.into(), v["title"].as_str().ok_or("немає назви проєкту")?.into(), v["icon_url"].as_str().unwrap_or("").into()))
 }
 
 /// (id, назва, іконка) проєкту CurseForge за slug через Core API (потрібен ключ).
 pub fn curse_lookup_slug(key: &str, slug: &str) -> Result<(String, String, String), String> {
+    if !slug_ok(slug) {
+        return Err(format!("Некоректний slug «{}»", slug.chars().take(40).collect::<String>()));
+    }
     let v = get_json(&client_t(20)?, &format!("{}/v1/mods/search?gameId=432&slug={slug}", core()), ("x-api-key", key))?;
     let d = v["data"].as_array().and_then(|a| a.first()).ok_or_else(|| format!("Проєкт «{slug}» не знайдено на CurseForge"))?;
     let (name, icon) = parse_curse_mod(&json!({ "data": d })).ok_or("немає назви проєкту")?;
@@ -534,6 +540,49 @@ pub struct Release {
     pub loaders: Vec<String>,
     pub release_type: String,
     pub changelog: String,
+    /// Лише Modrinth: позначити версію рекомендованою.
+    pub featured: bool,
+    /// Лише Modrinth: slug/id модів-залежностей, що їх користувач вирішив надіслати (зіставляються з проєктами перед відправкою).
+    pub dep_slugs: Vec<String>,
+    /// Лише Modrinth: id проєктів-залежностей після зіставлення (заповнює publish_modrinth).
+    pub dep_ids: Vec<String>,
+    /// Лише Modrinth: додаткові файли версії (sources, dev-jar), до MAX_EXTRA.
+    pub extra_files: Vec<PathBuf>,
+}
+
+pub const MAX_EXTRA: usize = 3;
+
+/// Перевірка додаткового файлу: існує, .jar/.zip, не порожній, у межах ліміту, не збігається з основним за назвою.
+fn check_extra(e: &Path, main: &Path) -> Result<(), String> {
+    let name = e.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !e.is_file() {
+        return Err(format!("Додатковий файл «{name}» не існує"));
+    }
+    let ext = e.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
+    if !["jar", "zip"].contains(&ext.as_str()) {
+        return Err(format!("Додатковий файл «{name}»: дозволені лише .jar і .zip"));
+    }
+    match std::fs::metadata(e).map(|m| m.len()) {
+        Ok(0) => return Err(format!("Додатковий файл «{name}» порожній (0 байт)")),
+        Ok(n) if n > MAX_FILE => return Err(format!("Додатковий файл «{name}» завеликий ({} МБ): ліміт {} МБ", n >> 20, MAX_FILE >> 20)),
+        _ => {}
+    }
+    if e.file_name() == main.file_name() {
+        return Err(format!("Додатковий файл має ту саму назву, що й основний («{name}»): Modrinth таке відхиляє"));
+    }
+    Ok(())
+}
+
+/// Короткий підсумок майбутньої відправки для нижньої панелі: що саме піде на сайти.
+pub fn release_summary(project: &str, r: &Release, mr: bool, cf: bool) -> String {
+    let mut p = vec![format!("«{}»", display_name(r)), r.release_type.clone(), format!("MC {}", r.mc_versions.join(", ")), r.loaders.join(", ")];
+    p.push(match (mr, cf) { (true, true) => "Modrinth + CurseForge", (true, false) => "Modrinth", (false, true) => "CurseForge", _ => "без платформ" }.into());
+    if mr {
+        if !r.extra_files.is_empty() { p.push(format!("+{} дод. файл(и)", r.extra_files.len())); }
+        if !r.dep_slugs.is_empty() { p.push(format!("залежності: {}", r.dep_slugs.join(", "))); }
+        if r.featured { p.push("рекомендована".into()); }
+    }
+    format!("{project}: {}", p.join(" · "))
 }
 
 /// Тип релізу за позначкою в номері: alpha/snapshot/dev → alpha, beta/rc/pre → beta; без позначки None.
@@ -586,6 +635,10 @@ fn human(st: reqwest::StatusCode) -> &'static str {
     }
 }
 
+/// Тести, що ставлять MODWIRE_CONFIG_DIR (env глобальний), беруть цей замок.
+#[cfg(test)]
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Default, Debug, Clone)]
 pub struct JarInfo {
     pub version: Option<String>,
@@ -597,11 +650,21 @@ pub struct JarInfo {
     pub deps: Vec<String>,
 }
 
+const MAX_DEPS_SEEN: usize = 64;
+/// Скільки залежностей зіставляємо з Modrinth за одну публікацію (кожна = мережевий запит).
+const MAX_DEPS_SEND: usize = 20;
+
+/// Slug/id проєкту безпечний для підстановки в URL (літери, цифри, - _ .; без / ? # та "..").
+fn slug_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s != ".." && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
 /// Id мода-залежності без службових (minecraft, java, лоадери).
 fn push_dep(out: &mut Vec<String>, id: &str) {
     let id = id.trim();
     let skip = ["minecraft", "java", "fabricloader", "fabric-loader", "quilt_loader", "quilt-loader", "forge", "neoforge", "fml", "javafml", "mixinextras"];
-    if !id.is_empty() && !skip.contains(&id) && !out.iter().any(|o| o == id) {
+    // ліміт: jar з тисячами залежностей не має роздувати список і гальмувати перевірку дублів
+    if out.len() < MAX_DEPS_SEEN && !id.is_empty() && !skip.contains(&id) && !out.iter().any(|o| o == id) {
         out.push(id.to_string());
     }
 }
@@ -642,7 +705,7 @@ pub fn mc_exact(s: &str) -> Option<String> {
 }
 
 fn push_mc(out: &mut Vec<String>, v: Option<String>) {
-    if let Some(v) = v.filter(|v| !out.contains(v)) {
+    if let Some(v) = v.filter(|v| out.len() < MAX_DEPS_SEEN && !out.contains(v)) {
         out.push(v);
     }
 }
@@ -875,6 +938,9 @@ pub fn validate(project_ok: bool, any_platform: bool, r: &Release, file: Option<
         return Err("Оберіть хоча б один лоадер".into());
     }
     let f = file.ok_or("Оберіть файл")?;
+    if r.extra_files.len() > MAX_EXTRA {
+        return Err(format!("Додаткових файлів не більше {MAX_EXTRA}"));
+    }
     if !f.is_file() {
         return Err("Файл не існує".into());
     }
@@ -886,6 +952,12 @@ pub fn validate(project_ok: bool, any_platform: bool, r: &Release, file: Option<
         Ok(0) => return Err("Файл порожній (0 байт)".into()),
         Ok(n) if n > MAX_FILE => return Err(format!("Файл завеликий ({} МБ): ліміт платформ {} МБ", n >> 20, MAX_FILE >> 20)),
         _ => {}
+    }
+    for (k, e) in r.extra_files.iter().enumerate() {
+        check_extra(e, f)?;
+        if r.extra_files[..k].iter().any(|o| o.file_name() == e.file_name()) {
+            return Err("Серед додаткових файлів є однакові назви".into());
+        }
     }
     Ok(())
 }
@@ -899,13 +971,13 @@ pub fn modrinth_data(r: &Release, project_id: &str) -> Value {
         "name": display_name(r),
         "version_number": r.number.trim(),
         "changelog": r.changelog,
-        "dependencies": [],
+        "dependencies": r.dep_ids.iter().map(|id| json!({"project_id": id, "dependency_type": "required"})).collect::<Vec<_>>(),
         "game_versions": r.mc_versions,
         "version_type": r.release_type,
         "loaders": r.loaders,
-        "featured": false,
+        "featured": r.featured,
         "project_id": project_id,
-        "file_parts": ["file"],
+        "file_parts": std::iter::once("file".to_string()).chain((1..=r.extra_files.len()).map(|i| format!("file{i}"))).collect::<Vec<_>>(),
     })
 }
 
@@ -1291,6 +1363,43 @@ fn upload_err(e: reqwest::Error, up: &Up) -> String {
     }
 }
 
+/// Додатковий файл версії: без лічильника прогресу (його веде основний файл).
+/// Додатковий файл: скасування діє і під час його відправки (прогрес рахується лише для основного).
+struct CancelRead {
+    f: std::fs::File,
+    up: Up,
+}
+
+impl std::io::Read for CancelRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.up.cancel.load(Relaxed) {
+            return Err(std::io::Error::other("cancelled"));
+        }
+        self.f.read(buf)
+    }
+}
+
+fn extra_part(file: &Path, up: &Up) -> Result<multipart::Part, String> {
+    let f = std::fs::File::open(file).map_err(|_| "Додатковий файл зник з диска. Оберіть його знову".to_string())?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    let mime = if file.extension().is_some_and(|e| e.eq_ignore_ascii_case("jar")) { "application/java-archive" } else { "application/zip" };
+    multipart::Part::reader_with_length(CancelRead { f, up: up.clone() }, len).file_name(name).mime_str(mime).map_err(|e| e.to_string())
+}
+
+fn sha512_file(p: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha512};
+    let mut h = Sha512::new();
+    std::io::copy(&mut std::fs::File::open(p)?, &mut h)?;
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Версія Modrinth із таким самим файлом (за sha512). Будь-яка помилка чи 404 = None: перевірка не блокує публікацію.
+fn version_by_hash(token: &str, hash: &str) -> Option<Value> {
+    let r = client_t(15).ok()?.get(format!("{}/v2/version_file/{hash}?algorithm=sha512", mr())).header("Authorization", token).send().ok()?;
+    if r.status().is_success() { r.json().ok() } else { None }
+}
+
 fn json_part(s: &str) -> Result<multipart::Part, String> {
     multipart::Part::text(s.to_string()).mime_str("application/json").map_err(|e| e.to_string())
 }
@@ -1335,14 +1444,45 @@ fn preflight(file: &Path, up: &Up) -> Result<(), String> {
 
 pub fn publish_modrinth(token: &str, project_id: &str, r: &Release, file: &Path, up: &Up) -> Result<String, String> {
     preflight(file, up)?;
+    for e in &r.extra_files {
+        preflight(e, up)?;
+    }
     let existing = mr_get(&client_get()?, token, &format!("/project/{project_id}/version"))?;
     if existing.as_array().is_some_and(|a| a.iter().any(|v| v["version_number"] == r.number.trim() && v["loaders"].as_array().is_some_and(|l| l.iter().any(|x| r.loaders.iter().any(|y| x == y.as_str()))))) {
         return Err(format!("версія {} для цього лоадера вже є на Modrinth, пропущено (змініть номер, якщо це нова збірка)", r.number.trim()));
     }
-    let data = modrinth_data(r, project_id).to_string();
-    let v = post_upload(&format!("{}/v2/version", mr()), ("Authorization", token), || Ok(multipart::Form::new().part("data", json_part(&data)?).part("file", file_part(file, up)?)), up)?;
+    // той самий файл під іншим номером: Modrinth відхилив би його вже після завантаження
+    if let Some(v) = sha512_file(file).ok().and_then(|h| version_by_hash(token, &h)).filter(|v| v["project_id"] == project_id) {
+        return Err(format!("цей файл уже опубліковано на Modrinth як версію {} (id {}), пропущено", v["version_number"].as_str().unwrap_or("?"), v["id"].as_str().unwrap_or("?")));
+    }
+    let mut r = r.clone();
+    r.dep_ids.clear();
+    let mut missing = vec![];
+    for slug in r.dep_slugs.clone().iter().take(MAX_DEPS_SEND) {
+        if up.cancel.load(Relaxed) {
+            return Err(CANCELLED.into());
+        }
+        match modrinth_lookup(token, slug) {
+            Ok((id, ..)) => {
+                if id != project_id && !r.dep_ids.contains(&id) {
+                    r.dep_ids.push(id);
+                }
+            }
+            Err(_) => missing.push(slug.as_str().to_string()),
+        }
+    }
+    let data = modrinth_data(&r, project_id).to_string();
+    let build = || {
+        let mut form = multipart::Form::new().part("data", json_part(&data)?).part("file", file_part(file, up)?);
+        for (i, e) in r.extra_files.iter().enumerate() {
+            form = form.part(format!("file{}", i + 1), extra_part(e, up)?);
+        }
+        Ok(form)
+    };
+    let v = post_upload(&format!("{}/v2/version", mr()), ("Authorization", token), build, up)?;
+    let note = if missing.is_empty() { String::new() } else { format!(" (залежності не знайдено на Modrinth і не додані: {})", missing.join(", ")) };
     match v["id"].as_str() {
-        Some(id) => Ok(format!("версія {id} https://modrinth.com/project/{project_id}/version/{id}")),
+        Some(id) => Ok(format!("версія {id}{note} https://modrinth.com/project/{project_id}/version/{id}")),
         None => Ok("версію опубліковано (сервер не повернув id)".into()),
     }
 }
@@ -1482,9 +1622,18 @@ fn check_repo(repo: &str) -> Result<Option<Update>, String> {
 /// Видаляє залишок попереднього оновлення (modwire.exe.old). Помилку ігноруємо: файл міг ще тримати старий процес.
 pub fn cleanup_update() {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::fs::remove_file(exe.with_extension("exe.old"));
-        let _ = std::fs::remove_file(exe.with_extension("exe.new"));
+        cleanup_at(&exe);
     }
+}
+
+fn cleanup_at(exe: &Path) {
+    let _ = std::fs::remove_file(exe.with_extension("exe.old"));
+    let _ = std::fs::remove_file(exe.with_extension("exe.new"));
+}
+
+/// Скільки чекати перед видаленням .old: після оновлення (`--updated`) 30 с, щоб зламану збірку можна було повернути.
+pub fn old_grace(updated: bool) -> Duration {
+    Duration::from_secs(if updated { 30 } else { 0 })
 }
 
 /// Перевіряє завантажений файл: розмір і сигнатура виконуваного файлу Windows («MZ»).
@@ -1623,6 +1772,7 @@ mod tests {
             loaders: vec!["fabric".into()],
             release_type: "release".into(),
             changelog: "ok".into(),
+            ..Default::default()
         }
     }
 
@@ -1896,7 +2046,7 @@ mod tests {
     // ----- mock-сервер: на кожне з'єднання одна відповідь за маршрутом "МЕТОД /шлях" -----
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn mock(n: usize, routes: Vec<(&'static str, u16, &'static str)>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    fn mock_secs(n: usize, routes: Vec<(&'static str, u16, &'static str)>, secs: u64) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
@@ -1904,7 +2054,7 @@ mod tests {
         let h = std::thread::spawn(move || {
             let mut seen = vec![];
             // не більше n з'єднань і не довше 5 с: якщо клієнт відкрив менше, тест падає, а не висить
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + Duration::from_secs(secs);
             while seen.len() < n && std::time::Instant::now() < deadline {
                 let Ok((mut s, _)) = l.accept() else {
                     std::thread::sleep(Duration::from_millis(5));
@@ -1927,16 +2077,27 @@ mod tests {
                 let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
                 let len: usize = head.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0))).unwrap_or(0);
                 let mut got = buf.len() - head_end;
-                while got < len {
+                // тіло без Content-Length (chunked, великі файли) читаємо до завершального чанка; у `seen` зберігаємо лише початок
+                let chunked = head.to_lowercase().contains("transfer-encoding: chunked");
+                let mut tail: Vec<u8> = buf[head_end.min(buf.len())..].iter().rev().take(5).rev().copied().collect();
+                while got < len || (chunked && !tail.ends_with(b"0\r\n\r\n")) {
                     match s.read(&mut tmp) {
                         Ok(0) | Err(_) => break,
-                        Ok(k) => got += k,
+                        Ok(k) => {
+                            got += k;
+                            if buf.len() < head_end + 262_144 {
+                                buf.extend_from_slice(&tmp[..k]);
+                            }
+                            tail.extend_from_slice(&tmp[..k]);
+                            tail.drain(..tail.len().saturating_sub(5));
+                        }
                     }
                 }
+                let body_text = String::from_utf8_lossy(&buf[head_end.min(buf.len())..]).into_owned();
                 let line = head.lines().next().unwrap_or("").to_string();
                 let (code, body) = routes.iter().find(|(k, _, _)| line.starts_with(k)).map_or((404, "{}"), |r| (r.1, r.2));
                 let _ = write!(s, "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                seen.push(head.clone());
+                seen.push(format!("{head}{body_text}"));
             }
             seen
         });
@@ -1952,8 +2113,12 @@ mod tests {
     }
 
     fn with_mock<T>(n: usize, routes: Vec<(&'static str, u16, &'static str)>, f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        with_mock_secs(n, routes, 5, f)
+    }
+
+    fn with_mock_secs<T>(n: usize, routes: Vec<(&'static str, u16, &'static str)>, secs: u64, f: impl FnOnce() -> T) -> (T, Vec<String>) {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let (url, h) = mock(n, routes);
+        let (url, h) = mock_secs(n, routes, secs);
         *TEST_BASE.lock().unwrap_or_else(|e| e.into_inner()) = Some(url);
         let out = {
             let _b = BaseGuard;
@@ -1974,12 +2139,12 @@ mod tests {
     #[test]
     fn modrinth_publish_flow() {
         let up = Up::default();
-        let (r, seen) = with_mock(2, vec![("GET /v2/project/P/version", 200, "[]"), ("POST /v2/version", 200, r#"{"id":"VER1"}"#)], || {
+        let (r, seen) = with_mock(3, vec![("GET /v2/project/P/version", 200, "[]"), ("POST /v2/version", 200, r#"{"id":"VER1"}"#)], || {
             publish_modrinth("tok", "P", &rel(), &jar(), &up)
         });
         let ok = r.unwrap();
         assert!(ok.contains("VER1") && ok.contains("https://modrinth.com/project/P/version/VER1"), "{ok}");
-        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.len(), 3, "версії, хеш файлу, відправка");
         let all = seen.join("\n").to_lowercase();
         assert!(all.contains("authorization: tok"), "токен без Bearer");
         assert!(all.contains("user-agent: mod-publisher/"));
@@ -1996,7 +2161,7 @@ mod tests {
 
         // той самий номер, але інший лоадер: дозволено
         let other = r#"[{"version_number":"1.0.0","loaders":["forge"]}]"#;
-        let (r, _) = with_mock(2, vec![("GET /v2/project/P/version", 200, other), ("POST /v2/version", 200, r#"{"id":"V2"}"#)], || {
+        let (r, _) = with_mock(3, vec![("GET /v2/project/P/version", 200, other), ("POST /v2/version", 200, r#"{"id":"V2"}"#)], || {
             publish_modrinth("t", "P", &rel(), &jar(), &Up::default())
         });
         assert!(r.is_ok());
@@ -2048,7 +2213,7 @@ mod tests {
         let vers = r#"[{"id":11,"gameVersionTypeID":1,"name":"1.20.1"},{"id":12,"gameVersionTypeID":68441,"name":"Fabric"}]"#;
         let f = jar();
         let (res, _) = with_mock(
-            5,
+            6,
             vec![
                 ("GET /v2/project/P/version", 200, "[]"),
                 ("POST /v2/version", 200, r#"{"id":"V9"}"#),
@@ -2066,9 +2231,9 @@ mod tests {
     #[test]
     fn post_429_retried_once() {
         let f = jar();
-        let (r, seen) = with_mock(3, vec![("GET /v2/project/P/version", 200, "[]"), ("POST /v2/version", 429, "{}")], || publish_modrinth("t", "P", &rel(), &f, &Up::default()));
+        let (r, seen) = with_mock(4, vec![("GET /v2/project/P/version", 200, "[]"), ("POST /v2/version", 429, "{}")], || publish_modrinth("t", "P", &rel(), &f, &Up::default()));
         assert!(r.unwrap_err().contains("Забагато"));
-        assert_eq!(seen.len(), 3, "GET + POST + один повтор POST");
+        assert_eq!(seen.len(), 4, "GET версій + GET хеша + POST + один повтор POST");
     }
 
     #[test]
@@ -2140,6 +2305,103 @@ mod tests {
         );
         assert!(r.unwrap_err().contains("уже є"));
         assert_eq!(seen.len(), 2, "дві сторінки, далі файл не відправляється");
+    }
+
+    /// Тіло multipart-запиту з частиною "data": JSON між першим "{" і наступним рядком-межею.
+    fn data_json(req: &str) -> Value {
+        let i = req.find("name=\"data\"").expect("частина data");
+        let body = &req[i..];
+        let (a, b) = (body.find('{').unwrap(), body.find("
+--").unwrap());
+        serde_json::from_str(&body[a..b]).unwrap()
+    }
+
+    #[test]
+    fn options_off_keep_legacy_request() {
+        // payload без нових опцій = точно той, що був раніше
+        assert_eq!(
+            modrinth_data(&rel(), "AAA"),
+            json!({"name":"1.0.0","version_number":"1.0.0","changelog":"ok","dependencies":[],"game_versions":["1.20.1"],"version_type":"release","loaders":["fabric"],"featured":false,"project_id":"AAA","file_parts":["file"]})
+        );
+        // і в мережі: лише перевірка версій, хеш і відправка; жодного запиту проєктів-залежностей
+        let (r, seen) = with_mock(3, vec![("GET /v2/project/P/version", 200, "[]"), ("POST /v2/version", 200, r#"{"id":"V1"}"#)], || publish_modrinth("t", "P", &rel(), &jar(), &Up::default()));
+        assert!(r.is_ok());
+        assert_eq!(seen.len(), 3);
+        assert!(seen[1].starts_with("GET /v2/version_file/") && seen[1].contains("algorithm=sha512"));
+        let d = data_json(&seen[2]);
+        assert_eq!((d["dependencies"].clone(), d["featured"].clone(), d["file_parts"].clone()), (json!([]), json!(false), json!(["file"])));
+        assert!(!seen[2].contains("name=\"file1\""));
+    }
+
+    #[test]
+    fn dependencies_featured_and_extra_files_are_sent() {
+        let extra = jar();
+        let mut r = rel();
+        (r.featured, r.dep_slugs, r.extra_files) = (true, vec!["fabric-api".into(), "ghost".into(), "P".into()], vec![extra]);
+        let routes = vec![
+            ("GET /v2/project/P/version", 200, "[]"),
+            ("GET /v2/project/fabric-api", 200, r#"{"id":"P7dR8mSH","title":"Fabric API"}"#),
+            ("GET /v2/project/ghost", 404, "{}"),
+            ("GET /v2/project/P ", 200, r#"{"id":"P","title":"self"}"#),
+            ("POST /v2/version", 200, r#"{"id":"V2"}"#),
+        ];
+        let (res, seen) = with_mock(6, routes, || publish_modrinth("t", "P", &r, &jar(), &Up::default()));
+        let ok = res.unwrap();
+        assert!(ok.contains("V2") && ok.contains("ghost"), "ненайдена залежність названа в підсумку: {ok}");
+        let post = seen.iter().find(|s| s.starts_with("POST /v2/version")).unwrap();
+        let d = data_json(post);
+        assert_eq!(d["dependencies"], json!([{"project_id":"P7dR8mSH","dependency_type":"required"}]), "власний проєкт і невідомі пропущено");
+        assert_eq!((d["featured"].clone(), d["file_parts"].clone()), (json!(true), json!(["file", "file1"])));
+        assert!(post.contains("name=\"file\"") && post.contains("name=\"file1\""));
+    }
+
+    #[test]
+    fn same_file_hash_stops_before_upload() {
+        let hit = r#"{"id":"OLD1","project_id":"P","version_number":"0.9"}"#;
+        let (r, seen) = with_mock(2, vec![("GET /v2/project/P/version", 200, "[]"), ("GET /v2/version_file/", 200, hit)], || publish_modrinth("t", "P", &rel(), &jar(), &Up::default()));
+        let e = r.unwrap_err();
+        assert!(e.contains("0.9") && e.contains("OLD1") && e.contains("файл"), "{e}");
+        assert_eq!(seen.len(), 2, "файл не відправляється");
+        // той самий файл в іншому проєкті не блокує
+        let other = r#"{"id":"X","project_id":"Q","version_number":"1"}"#;
+        let (r, _) = with_mock(3, vec![("GET /v2/project/P/version", 200, "[]"), ("GET /v2/version_file/", 200, other), ("POST /v2/version", 200, r#"{"id":"V3"}"#)], || publish_modrinth("t", "P", &rel(), &jar(), &Up::default()));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn extra_files_validation_and_summary() {
+        let d = tmp_dir("extra");
+        let main = d.join("mod.jar");
+        zip_with(&main, &[("a", "x")]);
+        let mk = |n: &str| {
+            let p = d.join(n);
+            zip_with(&p, &[("a", "x")]);
+            p
+        };
+        let mut r = rel();
+        r.extra_files = vec![mk("mod-sources.jar")];
+        assert!(validate(true, true, &r, Some(&main)).is_ok());
+        r.extra_files = vec![mk("a.jar"), mk("b.jar"), mk("c.jar"), mk("d.jar")];
+        assert!(validate(true, true, &r, Some(&main)).unwrap_err().contains("не більше 3"));
+        r.extra_files = vec![mk("x.mrpack")];
+        assert!(validate(true, true, &r, Some(&main)).unwrap_err().contains(".jar і .zip"));
+        r.extra_files = vec![d.join("none.jar")];
+        assert!(validate(true, true, &r, Some(&main)).unwrap_err().contains("не існує"));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let same = d.join("sub").join("mod.jar");
+        zip_with(&same, &[("a", "x")]);
+        r.extra_files = vec![same];
+        assert!(validate(true, true, &r, Some(&main)).unwrap_err().contains("ту саму назву"));
+        let (e1, e2) = (mk("e.jar"), d.join("sub").join("e.jar"));
+        zip_with(&e2, &[("a", "x")]);
+        r.extra_files = vec![e1, e2];
+        assert!(validate(true, true, &r, Some(&main)).unwrap_err().contains("однакові"));
+
+        let mut r = rel();
+        assert_eq!(release_summary("Mod", &r, true, true), "Mod: «1.0.0» · release · MC 1.20.1 · fabric · Modrinth + CurseForge");
+        (r.featured, r.dep_slugs, r.extra_files, r.name) = (true, vec!["fabric-api".into()], vec![mk("s.jar")], "Моя".into());
+        assert_eq!(release_summary("Mod", &r, true, false), "Mod: «Моя» · release · MC 1.20.1 · fabric · Modrinth · +1 дод. файл(и) · залежності: fabric-api · рекомендована");
+        assert!(!release_summary("Mod", &r, false, true).contains("рекомендована"), "лише Modrinth");
     }
 
     #[test]
@@ -2616,6 +2878,7 @@ mod tests {
     #[test]
     fn config_dir_override_redirects_all_paths() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _e = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = std::env::temp_dir().join(format!("mp_cfgdir_{}", std::process::id()));
         // shortcut: set_var глобальний; безпечно, бо інші тести не читають цю змінну поза SERIAL
         unsafe { std::env::set_var("MODWIRE_CONFIG_DIR", &d) };
@@ -2697,5 +2960,89 @@ mod tests {
         // файл виріс понад 1 МБ, тож відбулась обрізка до 2000 рядків; жоден рядок не пошкоджений
         let all = std::fs::read_to_string(&p).unwrap();
         assert!(all.lines().count() > 0 && all.lines().all(|l| serde_json::from_str::<Value>(l).is_ok()));
+    }
+
+    #[test]
+    fn update_rollback_roundtrip_and_grace() {
+        let d = tmp_dir("upd_rb");
+        let (exe, new, old) = (d.join("modwire.exe"), d.join("modwire.exe.new"), d.join("modwire.exe.old"));
+        let mut b = vec![0u8; 1_200_000];
+        b[..2].copy_from_slice(b"MZ");
+        std::fs::write(&exe, b"v1-good").unwrap();
+        std::fs::write(&new, &b).unwrap();
+        install(&exe, &new, &old, "").unwrap();
+        // нова збірка не стартувала: відкат повертає v1, а .old більше немає
+        rollback_at(&exe).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"v1-good");
+        assert!(!old.exists());
+        // невдала перевірка нового файлу не чіпає ні exe, ні наявного .old
+        std::fs::write(&old, b"prev").unwrap();
+        std::fs::write(&new, b"junk").unwrap();
+        assert!(install(&exe, &new, &old, "").is_err());
+        assert_eq!((std::fs::read(&exe).unwrap(), std::fs::read(&old).unwrap()), (b"v1-good".to_vec(), b"prev".to_vec()));
+        // після --updated .old живе 30 с; у звичайному запуску прибирається одразу
+        assert_eq!(old_grace(true), Duration::from_secs(30));
+        assert!(old_grace(false).is_zero());
+        std::fs::write(&new, b"x").unwrap();
+        cleanup_at(&exe);
+        assert!(!old.exists() && !new.exists() && exe.exists());
+    }
+
+    #[test]
+    fn jar_dependency_lists_are_bounded_and_slugs_safe() {
+        // 200 тис. залежностей у fabric.mod.json: розбір швидкий, список обмежений
+        let d = tmp_dir("deps_cap");
+        let depends: String = (0..200_000).map(|i| format!("\"m{i}\":\"*\"")).collect::<Vec<_>>().join(",");
+        let f = d.join("big.jar");
+        zip_with(&f, &[("fabric.mod.json", &format!("{{\"version\":\"1\",\"depends\":{{{depends}}}}}"))]);
+        let t = std::time::Instant::now();
+        let info = read_jar(&f).unwrap();
+        assert!(info.deps.len() <= MAX_DEPS_SEEN && t.elapsed() < Duration::from_secs(5), "{} за {:?}", info.deps.len(), t.elapsed());
+        // зіпсований/порожній toml і дивні символи не панікують
+        for t in ["", "[[dependencies.m]]", "[[dependencies.m]]\nmodId=\nmandatory", "modId = \"x\"\nmandatory=true", "[[dependencies.\n\u{1F600} = \u{1F600}"] {
+            let _ = (toml_deps(t), toml_mc(t), toml_version(t));
+        }
+        assert_eq!(toml_deps("[[dependencies.m]]\nmodId=\"geckolib\" # c\nmandatory=true\n"), vec!["geckolib"]);
+        // slug із чужого jar не потрапляє в URL: помилка без запитів
+        for bad in ["../user", "a/b", "x?y=1", "", "..", &"a".repeat(65), "кирилиця"] {
+            assert!(!slug_ok(bad), "{bad}");
+            assert!(modrinth_lookup("t", bad).unwrap_err().contains("Некоректний"));
+            assert!(curse_lookup_slug("k", bad).unwrap_err().contains("Некоректний"));
+        }
+        assert!(slug_ok("fabric-api") && slug_ok("AANobbMI") && slug_ok("a.b_c"));
+    }
+
+    #[test]
+    fn extra_file_upload_honours_cancel() {
+        use std::io::Read;
+        let d = tmp_dir("extra_cancel");
+        let f = d.join("x.jar");
+        std::fs::write(&f, vec![1u8; 10_000]).unwrap();
+        let up = Up::default();
+        let mut r = CancelRead { f: std::fs::File::open(&f).unwrap(), up: up.clone() };
+        let mut buf = [0u8; 100];
+        assert_eq!(r.read(&mut buf).unwrap(), 100);
+        up.cancel.store(true, Relaxed);
+        assert!(r.read(&mut buf).is_err(), "скасування обриває й додатковий файл");
+    }
+
+    #[test]
+    fn publish_100mb_streams_without_loading_into_memory() {
+        // файл 100 МБ (рідкий): мок читає тіло; прогрес доходить до кінця
+        let d = tmp_dir("big100");
+        let f = d.join("big.jar");
+        {
+            let mut h = std::fs::File::create(&f).unwrap();
+            std::io::Write::write_all(&mut h, b"PK").unwrap();
+            h.set_len(100 << 20).unwrap();
+        }
+        let up = Up::default();
+        let t = std::time::Instant::now();
+        let (r, seen) = with_mock_secs(3, vec![("GET /v2/project/P/version", 200, "[]"), ("GET /v2/version_file", 404, "{}"), ("POST /v2/version", 200, r#"{"id":"BIG"}"#)], 120, || publish_modrinth("tok", "P", &rel(), &f, &up));
+        let secs = t.elapsed().as_secs_f64();
+        assert_eq!(seen.len(), 3);
+        assert!(r.unwrap().contains("BIG"));
+        assert_eq!(up.prog.sent.load(Relaxed), 100 << 20);
+        eprintln!("100 МБ на моку: {secs:.2} с ({:.0} МБ/с)", 100.0 / secs);
     }
 }

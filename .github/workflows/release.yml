@@ -13,14 +13,14 @@ jobs:
     env:
       CARGO_TARGET_DIR: C:/mp-target
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Тег збігається з версією в Cargo.toml
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: test "v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" = "${{ github.ref_name }}"
       - run: cargo test --locked
       - run: cargo build --release --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: modwire-windows
           path: C:/mp-target/release/modwire.exe
@@ -28,7 +28,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - run: |
           cargo build --release --locked --target aarch64-apple-darwin
@@ -57,7 +57,7 @@ jobs:
           sed -i '' "s|<string>0.1.0</string>|<string>$V</string>|" "Modwire.app/Contents/Info.plist"
           codesign --force --deep -s - "Modwire.app"
           hdiutil create -volname "Modwire" -srcfolder "Modwire.app" -ov -format UDZO Modwire.dmg
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: modwire-macos
           path: Modwire.dmg
@@ -69,10 +69,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*

@@ -174,13 +174,13 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
 /// Аркуш усіх значків у розмірах 12–32 px і зразки кнопок/бейджів/банера для перевірки вирівнювання.
 fn icon_sheet(ctx: &egui::Context) {
     use super::{draw_icon, ghost_btn, icon_btn, Ic, BG, MUTED, TEXT};
-    let all = [Ic::Plus, Ic::Check, Ic::Cross, Ic::Upload, Ic::Gear, Ic::Trash, Ic::External, Ic::Eye, Ic::Warn, Ic::Info, Ic::Grid, Ic::File, Ic::Chevron, Ic::Refresh, Ic::Pin];
+    let all = [Ic::Plus, Ic::Check, Ic::Cross, Ic::Upload, Ic::Gear, Ic::Trash, Ic::External, Ic::Eye, Ic::Warn, Ic::Info, Ic::Grid, Ic::File, Ic::Chevron, Ic::Refresh, Ic::Pin, Ic::ChevronUp, Ic::Copy];
     egui::Area::new(egui::Id::NULL.with("shots_icons")).order(egui::Order::Foreground).fixed_pos(egui::pos2(0.0, 0.0)).show(ctx, |ui| {
         ui.painter().rect_filled(ctx.content_rect(), 0, BG);
         let mut y = 28.0;
         for size in [12.0, 14.0, 16.0, 20.0, 32.0] {
             for (i, ic) in all.iter().enumerate() {
-                draw_icon(ui.painter(), egui::pos2(40.0 + i as f32 * 56.0, y), *ic, size, TEXT);
+                draw_icon(ui.painter(), egui::pos2(30.0 + i as f32 * 46.0, y), *ic, size, TEXT);
             }
             ui.painter().text(egui::pos2(880.0, y), egui::Align2::RIGHT_CENTER, format!("{size}px"), egui::FontId::proportional(12.0), MUTED);
             y += size.max(24.0) + 18.0;
