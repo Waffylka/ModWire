@@ -25,7 +25,7 @@ A native desktop app written in Rust ([egui](https://github.com/emilk/egui)). Pi
 - **Autofill from the file.** Version number, name, exact Minecraft versions and loaders (Fabric, Quilt, Forge, NeoForge) are read from `.jar` and `.mrpack` files.
 - **Projects.** Add them from your Modrinth list or by CurseForge ID, pin them (pinning keeps your manual order of the rest; "Sort by name" is a separate button) and get icons and names from the APIs.
 - **Changelog templates.** Placeholders `{version} {mc} {loaders} {date} {project}`, with a separate template per project.
-- **Checks before upload.** Warnings for a repeated or lower version number and unknown Minecraft versions, plus readable API error messages.
+- **Checks before upload.** Warnings for a repeated or lower version number, unknown Minecraft versions, and a file whose loader or Minecraft version differs from the selected ones, plus readable API error messages.
 - **Publish history** with search, a failures-only filter, open / copy link for each published version, and CSV export.
 - **Auto-update.** An "update available" banner with an Update button (Windows). The download is verified (size, SHA-256 from the release when available), the folder must be writable, and if the new build crashes right after start the previous version is restored.
 - **Import and export of projects** without tokens, and a safe config save with a backup copy.

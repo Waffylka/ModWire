@@ -32,6 +32,7 @@ const SCENES: &[(&str, f32, f32)] = &[
     ("add_dialog", 900.0, 580.0), ("add_dialog", 760.0, 480.0),
     ("merge", 900.0, 580.0), ("merge", 760.0, 480.0),
     ("empty", 900.0, 580.0), ("empty", 760.0, 480.0),
+    ("icons", 900.0, 520.0),
 ];
 
 fn state() -> Option<&'static Mutex<State>> {
@@ -121,6 +122,16 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
     app.mc_known = ["1.21.1", "1.20.6", "1.20.4", "1.20.1"].map(String::from).to_vec();
     app.mc_all = app.mc_known.clone();
     ctx.request_repaint();
+    // MODWIRE_SHOT_SCALE=1.0 — масштаб інтерфейсу (за замовчуванням системний); MODWIRE_SHOT_ONLY=icons — лише сцени з цією назвою
+    let scale = std::env::var("MODWIRE_SHOT_SCALE").ok().and_then(|v| v.parse::<f32>().ok());
+    if let Some(sc) = scale && (ctx.pixels_per_point() - sc).abs() > 0.001 {
+        ctx.set_pixels_per_point(sc);
+    }
+    if let Ok(only) = std::env::var("MODWIRE_SHOT_ONLY") {
+        while SCENES.get(st.idx).is_some_and(|s| !s.0.starts_with(only.as_str())) {
+            st.idx += 1;
+        }
+    }
     let Some(&(scene, w, h)) = SCENES.get(st.idx) else {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         return;
@@ -129,6 +140,9 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
         let dir = st.dir.clone();
         scene_setup(app, scene, &dir, &mut st.saved_projects);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+    }
+    if scene == "icons" {
+        icon_sheet(ctx);
     }
     st.frame += 1;
     if st.frame == 30 {
@@ -140,10 +154,41 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
     let got = st.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(img) = got {
         let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
-        let path = st.dir.join(format!("{scene}_{w}x{h}.png"));
+        let path = st.dir.join(format!("{scene}_{w}x{h}{}.png", scale.map_or(String::new(), |s| format!("@{s}x"))));
         let _ = image::save_buffer(path, &bytes, img.width() as u32, img.height() as u32, image::ColorType::Rgba8);
         (st.idx, st.frame) = (st.idx + 1, 0);
     } else if st.frame > 400 {
         (st.idx, st.frame) = (st.idx + 1, 0); // не дочекались знімка: йдемо далі
     }
+}
+
+/// Аркуш усіх значків у розмірах 12–32 px і зразки кнопок/бейджів/банера для перевірки вирівнювання.
+fn icon_sheet(ctx: &egui::Context) {
+    use super::{draw_icon, ghost_btn, icon_btn, Ic, BG, MUTED, TEXT};
+    let all = [Ic::Plus, Ic::Check, Ic::Cross, Ic::Upload, Ic::Gear, Ic::Trash, Ic::External, Ic::Eye, Ic::Warn, Ic::Info, Ic::Grid, Ic::File, Ic::Chevron, Ic::Refresh, Ic::Pin];
+    egui::Area::new(egui::Id::NULL.with("shots_icons")).order(egui::Order::Foreground).fixed_pos(egui::pos2(0.0, 0.0)).show(ctx, |ui| {
+        ui.painter().rect_filled(ctx.content_rect(), 0, BG);
+        let mut y = 28.0;
+        for size in [12.0, 14.0, 16.0, 20.0, 32.0] {
+            for (i, ic) in all.iter().enumerate() {
+                draw_icon(ui.painter(), egui::pos2(40.0 + i as f32 * 56.0, y), *ic, size, TEXT);
+            }
+            ui.painter().text(egui::pos2(880.0, y), egui::Align2::RIGHT_CENTER, format!("{size}px"), egui::FontId::proportional(12.0), MUTED);
+            y += size.max(24.0) + 18.0;
+        }
+        ui.scope_builder(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(egui::pos2(24.0, y + 4.0), egui::vec2(850.0, 200.0))), |ui| {
+            ui.horizontal(|ui| {
+                for (ic, t) in [(Ic::Plus, "Додати"), (Ic::Upload, "Файл"), (Ic::Trash, "Видалити"), (Ic::Refresh, "Оновити"), (Ic::External, "Відкрити")] {
+                    ghost_btn(ui, Some(ic), t);
+                }
+                icon_btn(ui, Some(Ic::Check), "Перевірити", true);
+            });
+            ui.add_space(8.0);
+            super::badge_ic(ui, "Готово", super::SUCCESS, Some(Ic::Check));
+            ui.add_space(4.0);
+            super::banner(ui, super::Kind::Warn, "Попередження з довгим текстом, щоб побачити вирівнювання значка по першому рядку.");
+            ui.add_space(4.0);
+            super::banner(ui, super::Kind::Error, "Помилка");
+        });
+    });
 }

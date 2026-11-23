@@ -367,7 +367,8 @@ pub fn parse_projects_file(s: &str) -> Result<Vec<Project>, String> {
     let v: Value = serde_json::from_str(s).map_err(|e| format!("не JSON: {e}"))?;
     let list = if v.is_array() { v } else { v["projects"].clone() };
     let ps: Vec<Project> = serde_json::from_value(list).map_err(|_| "У файлі немає списку проєктів".to_string())?;
-    Ok(ps.into_iter().filter(|p| !p.name.trim().is_empty() || !p.modrinth_id.is_empty() || !p.curse_id.is_empty()).collect())
+    // секретоподібні поля з чужого файлу не потрапляють у наш конфіг
+    Ok(ps.iter().map(strip_secrets).filter(|p| !p.name.trim().is_empty() || !p.modrinth_id.is_empty() || !p.curse_id.is_empty()).collect())
 }
 
 /// Зливає імпортовані проєкти: збіг за ID платформи доповнює наявний, решта додається. (додано, об'єднано)
@@ -448,7 +449,7 @@ fn human(st: reqwest::StatusCode) -> &'static str {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct JarInfo {
     pub version: Option<String>,
     pub name: Option<String>,
@@ -533,6 +534,25 @@ fn jar_entry(z: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<Strin
 }
 
 /// Версія й лоадери з метаданих jar. None, якщо файл не zip.
+/// Попередження, якщо вміст файлу не збігається з обраними лоадерами / версіями MC (порожній список = все гаразд).
+pub fn compat_warnings(info: &JarInfo, mc: &[String], loaders: &[String]) -> Vec<String> {
+    let mut w = vec![];
+    if !info.loaders.is_empty() {
+        let missing: Vec<&String> = loaders.iter().filter(|l| !info.loaders.contains(&l.as_str())).collect();
+        if !missing.is_empty() {
+            let m: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
+            w.push(format!("Файл виглядає як {}, але вибрано також: {}. Перевірте лоадери.", info.loaders.join("/"), m.join(", ")));
+        }
+    }
+    if !info.mc_versions.is_empty() {
+        let extra: Vec<&str> = mc.iter().filter(|v| !info.mc_versions.contains(v)).map(String::as_str).collect();
+        if !extra.is_empty() {
+            w.push(format!("У файлі вказано Minecraft {}, а вибрано також: {}. Перевірте версії.", info.mc_versions.join(", "), extra.join(", ")));
+        }
+    }
+    w
+}
+
 pub fn read_jar(path: &Path) -> Option<JarInfo> {
     let mut z = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
     let mut info = JarInfo::default();
@@ -2166,6 +2186,82 @@ mod tests {
     fn api_errors_have_advice() {
         assert!(human(reqwest::StatusCode::BAD_GATEWAY).contains("Зачекайте"));
         assert!(human(reqwest::StatusCode::UNAUTHORIZED).contains("Створіть новий токен"));
+    }
+
+    #[test]
+    fn publish_connection_drop_mid_body_is_safe_to_retry() {
+        use std::io::{Read, Write};
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        *TEST_BASE.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("http://{}", l.local_addr().unwrap()));
+        let _reset = BaseGuard;
+        l.set_nonblocking(true).unwrap();
+        let h = std::thread::spawn(move || {
+            let mut posts = 0;
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < end && posts < 1 {
+                let Ok((mut s, _)) = l.accept() else { std::thread::sleep(Duration::from_millis(5)); continue };
+                s.set_nonblocking(false).ok();
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                if buf[..n].starts_with(b"GET") {
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]");
+                } else {
+                    posts += 1;
+                    let _ = s.read(&mut buf); // частина тіла, далі обрив
+                }
+            }
+            posts
+        });
+        let r = publish_modrinth("t", "P", &rel(), &jar(), &Up::default());
+        let e = r.unwrap_err();
+        assert!(e.contains("перевірте на сайті"), "{e}");
+        assert_eq!(h.join().unwrap(), 1, "POST після обриву не повторюється автоматично");
+    }
+
+    #[test]
+    fn compat_warnings_flag_wrong_loader_and_mc() {
+        let info = JarInfo { loaders: vec!["fabric"], mc_versions: vec!["1.20.1".into()], ..Default::default() };
+        assert!(compat_warnings(&info, &["1.20.1".into()], &["fabric".into()]).is_empty());
+        let w = compat_warnings(&info, &["1.20.1".into(), "1.19".into()], &["forge".into()]);
+        assert_eq!(w.len(), 2);
+        assert!(w[0].contains("forge") && w[1].contains("1.19"));
+        assert!(compat_warnings(&JarInfo::default(), &["1.0".into()], &["forge".into()]).is_empty(), "без метаданих не гадаємо");
+    }
+
+    #[test]
+    fn schema2_config_opens_without_loss_and_tokens_never_leak() {
+        let d = std::env::temp_dir().join(format!("mp_s2_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("config.json");
+        let orig = json!({
+            "schema": 2, "modrinth_token": "mrp_SECRET1", "curse_token": "cf-SECRET2", "curse_core_key": "core-SECRET3",
+            "modrinth_checked": 11, "curse_checked": 22, "core_checked": 33, "future_top": [1, 2],
+            "projects": [{
+                "last_number": "1.0", "last_changelog": "x", "name": "A", "modrinth_id": "M1", "curse_id": "7", "icon_url": "https://i/x.png",
+                "mc_versions": "1.20.1", "loaders": ["fabric"], "release_type": "beta", "changelog_template": "t {version}",
+                "id": "p1", "pinned": true, "future_p": {"k": "v"}, "api_token": "SECRET4"
+            }],
+            "last": {"dir": "C:/m", "project": 0, "mc_versions": "1.20.1", "loaders": ["fabric"], "release_type": "beta", "future_l": 5}
+        });
+        std::fs::write(&p, serde_json::to_string_pretty(&orig).unwrap()).unwrap();
+        let (c, st) = load_from(&p);
+        assert!(matches!(st, Load::Fine));
+        save_to(&p, &c).unwrap();
+        let back: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, orig, "нічого не втрачено і не додано");
+        // секрети не виходять ні в експорт, ні в CSV історії, ні в запис історії
+        let exp = export_projects(&c.projects);
+        assert!(!exp.contains("SECRET"), "{exp}");
+        let hp = d.join("h.jsonl");
+        history_add_at(&hp, "A", "1.0", "Modrinth", &Err("помилка".into()));
+        let hist = history_load_at(&hp, 10);
+        assert!(!history_csv(&hist).contains("SECRET") && !std::fs::read_to_string(&hp).unwrap().contains("SECRET"));
+        // імпорт чужого повного config.json теж не переносить токени (ні верхні, ні у проєктах)
+        let imported = parse_projects_file(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(imported[0].extra.get("api_token").is_none() && imported[0].extra.contains_key("future_p"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
