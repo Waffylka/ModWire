@@ -6,7 +6,7 @@
 //! (для знімків режиму `shots`).
 
 use crate::{ACCENT, BG, CF_ORANGE, MR_GREEN, MUTED, ON_ACCENT, TEXT};
-use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 use std::time::{Duration, Instant};
 
 /// Моменти шкали часу, секунди.
@@ -60,7 +60,7 @@ impl Splash {
                 // ранній вихід: одразу до переходу в рейку
                 self.start = Instant::now() - Duration::from_secs_f32(T_MORPH);
             }
-            ctx.request_repaint();
+            ctx.request_repaint_after(Duration::from_millis(16)); // ≈60 кадрів/с, без гонки за кожен vsync
         }
     }
 }
@@ -184,14 +184,20 @@ impl Ctx<'_> {
         if to <= from || col.a() == 0 {
             return;
         }
-        let n = 90;
-        for i in 0..=n {
-            let u = from + (to - from) * i as f32 / n as f32;
-            let q = match which {
-                Some(b) => along(g, b, u),
-                None => lerp_pos(g.stem[0], g.stem[1], u),
-            };
-            self.dot(q, width / 2.0, col);
+        // одна ламана з круглими кінцями замість сотні кружечків: у рази менше геометрії за кадр
+        let n = 36;
+        let pts: Vec<Pos2> = (0..=n)
+            .map(|i| {
+                let u = from + (to - from) * i as f32 / n as f32;
+                self.at(match which {
+                    Some(b) => along(g, b, u),
+                    None => lerp_pos(g.stem[0], g.stem[1], u),
+                })
+            })
+            .collect();
+        self.painter.add(egui::epaint::PathShape::line(pts.clone(), Stroke::new(width * self.k, col)));
+        for q in [pts[0], pts[n]] {
+            self.painter.circle_filled(q, width / 2.0 * self.k, col);
         }
     }
 }
@@ -252,12 +258,9 @@ fn paint(painter: &egui::Painter, screen: Rect, t: f32, target: Rect) {
         let head = ease_in_out(pulse) * 1.14;
         let spark = Color32::from_rgb(0xff, 0xf1, 0xd6);
         for b in [&g.left, &g.right] {
-            let n = 24;
-            for i in 0..=n {
-                let u = head - 0.14 * i as f32 / n as f32;
-                if (0.0..=1.0).contains(&u) {
-                    cx.dot(along(&g, b, u), wire_w / 2.0 * (1.0 - morph), spark);
-                }
+            let pts: Vec<Pos2> = (0..=8).map(|i| head - 0.14 * i as f32 / 8.0).filter(|u| (0.0..=1.0).contains(u)).map(|u| cx.at(along(&g, b, u))).collect();
+            if pts.len() > 1 && morph < 1.0 {
+                painter.add(egui::epaint::PathShape::line(pts, Stroke::new(wire_w * (1.0 - morph) * k, spark)));
             }
         }
     }

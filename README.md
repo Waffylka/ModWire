@@ -76,7 +76,7 @@ cargo clippy --all-targets
    git tag v0.3.0
    git push origin v0.3.0
    ```
-3. `release.yml` builds `modwire.exe` and `Modwire.dmg` and attaches them to the release. If the tag does not match the version in `Cargo.toml`, the build stops.
+3. `release.yml` builds `modwire.exe` and `Modwire.dmg` and attaches them to the release together with a `SHA256SUMS` file (check a download with `sha256sum -c SHA256SUMS`). If the tag does not match the version in `Cargo.toml`, the build stops.
 
 ## Auto-update
 
@@ -95,7 +95,8 @@ Updates are accepted only from `https://github.com/Waffylka/ModWire/releases/dow
 
 - The interface is in Ukrainian only.
 - Auto-update replaces the file on Windows only; on macOS the button opens the release page. The build is not code-signed.
-- Auto-update verifies SHA-256 only when the release asset reports one.
+- Auto-update verifies SHA-256 only when the release asset reports one (GitHub adds it to new uploads); the app does not read `SHA256SUMS` itself, it is for manual checks. If GitHub rate-limits the update check, the app says so and you can retry later or download from the Releases page.
+- Keyboard and screen readers: Tab order follows the screen layout and dialogs trap focus, but the app has not been tested with a screen reader.
 - A publish interrupted mid-upload may still have reached the site: check the version list before retrying (the app warns about this).
 - CurseForge does not accept `.mrpack`; duplicate detection on CurseForge needs the optional Core API key and looks at the latest 500 files.
 - Tokens are stored as plain text in the config file.

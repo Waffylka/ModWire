@@ -45,6 +45,7 @@ const STEP_LINE: f32 = 2.0; // товщина з'єднувача кроків
 const PROJECT_CARD_H: f32 = 132.0;
 const CARD_MIN_W: f32 = 270.0;
 const GAP: f32 = 16.0;
+const CONTENT_MAX_W: f32 = 1100.0; // на широких вікнах контент не розтягується далі, а центрується
 const CTRL_H: f32 = 36.0; // кнопки, чипи, поля вводу
 const TOUCH_H: f32 = 28.0; // мінімум для клікабельних рядків, посилань і прапорців
 const PROG_H: f32 = 8.0; // смуга прогресу
@@ -355,7 +356,60 @@ fn field_label(ui: &mut egui::Ui, text: &str) -> egui::Id {
     ui.label(RichText::new(text).color(TEXT).strong().size(14.0)).id // для labelled_by: скрінрідер читає підпис поля
 }
 
+/// Фокус повертається на елемент, що відкрив діалог: запам'ятовуємо його в кадр відкриття (до того, як діалог забере фокус)
+/// і повертаємо в кадр закриття.
+fn dialog_focus(ctx: &egui::Context, key: &'static str, open: bool) {
+    let id = egui::Id::NULL.with(("dlg_focus", key));
+    let st: Option<(bool, Option<egui::Id>)> = ctx.data(|d| d.get_temp(id));
+    match (open, st) {
+        (true, None | Some((false, _))) => {
+            let f = ctx.memory(|m| m.focused());
+            ctx.data_mut(|d| d.insert_temp(id, (true, f)));
+        }
+        (false, Some((true, saved))) => {
+            if let Some(f) = saved {
+                ctx.memory_mut(|m| m.request_focus(f));
+            }
+            ctx.data_mut(|d| d.insert_temp(id, (false, None::<egui::Id>)));
+        }
+        _ => {}
+    }
+}
+
+/// Людська назва кнопки для скрінрідера (дієслово + об'єкт), коли видимий напис короткий або однаковий на кількох картках.
+fn aria(r: egui::Response, name: impl Into<String>) -> egui::Response {
+    let (enabled, name) = (r.enabled(), name.into());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, name.clone()));
+    r
+}
+
+/// Те саме для перемикачів: назва і стан «натиснуто/вибрано» (Role::CheckBox).
+fn aria_check(r: egui::Response, name: impl Into<String>, on: bool) -> egui::Response {
+    let (enabled, name) = (r.enabled(), name.into());
+    r.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, on, name.clone()));
+    r
+}
+
+/// Назва для скрінрідера поля без видимого підпису (пошук): текст поля, назва й підказка.
+fn name_edit(r: &egui::Response, name: &str, hint: &str, text: &str) {
+    r.widget_info(|| {
+        let mut i = egui::WidgetInfo::text_edit(true, text, text, hint);
+        i.label = Some(name.to_string());
+        i
+    });
+}
+
 /// Заголовок блоку (стиль Title).
+/// Смуга прогресу з видимою доріжкою (BORDER): стандартна зливалася з FIELD на картках.
+fn progress_bar(ui: &mut egui::Ui, f: f32, w: f32, col: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, PROG_H), egui::Sense::hover());
+    ui.painter().rect_filled(rect, PROG_R, BORDER);
+    if f > 0.0 {
+        let fill = egui::Rect::from_min_size(rect.min, egui::vec2((rect.width() * f.clamp(0.0, 1.0)).max(PROG_H), PROG_H));
+        ui.painter().rect_filled(fill, PROG_R, col);
+    }
+}
+
 fn title(text: impl Into<String>) -> RichText {
     RichText::new(text.into()).text_style(egui::TextStyle::Name("Title".into())).strong().color(TEXT)
 }
@@ -369,6 +423,7 @@ fn combo_box(salt: &str) -> egui::ComboBox<'_> {
 
 fn link(ui: &mut egui::Ui, help: &str, url: &str) {
     let resp = ui.add(egui::Button::new(RichText::new("Як отримати").color(LINK)).frame(false).min_size(egui::vec2(0.0, TOUCH_H)));
+    let resp = aria(resp, "Як отримати: показати інструкцію");
     egui::Popup::from_toggle_button_response(&resp)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .width(320.0)
@@ -531,10 +586,10 @@ fn step(ui: &mut egui::Ui, spec: StepSpec, open: &mut bool, f: impl FnOnce(&mut 
             ui.label(title(name));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !expanded {
-                    if ghost_btn(ui, None, "Змінити").clicked() {
+                    if aria(ghost_btn(ui, None, "Змінити"), format!("Змінити крок «{name}»")).clicked() {
                         *open = true;
                     }
-                } else if done && icon_only(ui, Ic::ChevronUp, "Згорнути крок", false).clicked() {
+                } else if done && aria(icon_only(ui, Ic::ChevronUp, "Згорнути крок", false), format!("Згорнути крок «{name}»")).clicked() {
                     *open = false;
                 }
             });
@@ -616,6 +671,23 @@ enum Kind {
 }
 
 /// Єдине повідомлення: смуга 3px зліва, значок і текст; відступи 12/8.
+/// Слово замість значка-символу для скрінрідера (✓/✕ не озвучуються): «Успішно», «Помилка» тощо; None — значок суто декоративний.
+fn icon_word(ic: Ic) -> Option<&'static str> {
+    match ic {
+        Ic::Check => Some("Успішно"),
+        Ic::Cross => Some("Помилка"),
+        Ic::Warn => Some("Попередження"),
+        Ic::Info => Some("Інформація"),
+        _ => None,
+    }
+}
+
+fn spoken_icon(resp: &egui::Response, ic: Ic) {
+    if let Some(w) = icon_word(ic) {
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, w));
+    }
+}
+
 fn banner(ui: &mut egui::Ui, kind: Kind, text: &str) {
     let (col, ic) = match kind {
         Kind::Info => (MUTED, Ic::Info),
@@ -638,7 +710,8 @@ fn banner_inner(ui: &mut egui::Ui, kind: Kind, text: &str, col: Color32, ic: Ic,
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 20.0), egui::Sense::hover());
+                let (rect, ir) = ui.allocate_exact_size(egui::vec2(16.0, 20.0), egui::Sense::hover());
+                spoken_icon(&ir, ic);
                 draw_icon(ui.painter(), rect.center(), ic, 16.0, col);
                 ui.add(egui::Label::new(RichText::new(text).color(TEXT)).wrap());
             });
@@ -653,7 +726,8 @@ fn banner_inner(ui: &mut egui::Ui, kind: Kind, text: &str, col: Color32, ic: Ic,
 fn icon_label(ui: &mut egui::Ui, ic: Ic, col: Color32, text: &str) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+        let (rect, ir) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+        spoken_icon(&ir, ic);
         draw_icon(ui.painter(), rect.center(), ic, 16.0, col);
         ui.add(egui::Label::new(RichText::new(text).color(TEXT)).truncate());
     });
@@ -663,7 +737,8 @@ fn icon_label(ui: &mut egui::Ui, ic: Ic, col: Color32, text: &str) {
 fn icon_label_c(ui: &mut egui::Ui, ic: Ic, col: Color32, text: &str, text_col: Color32) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+        let (rect, ir) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+        spoken_icon(&ir, ic);
         draw_icon(ui.painter(), rect.center(), ic, 16.0, col);
         ui.add(egui::Label::new(RichText::new(text).color(text_col)).truncate());
     });
@@ -824,7 +899,7 @@ fn token_field(ui: &mut egui::Ui, value: &mut String, show: &mut bool) -> bool {
             focused = te.has_focus();
             let label = if *show { i18n::tr("btn.hide") } else { "Показати" };
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
-            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{label} токен")));
             let p = ui.painter();
             if resp.hovered() {
                 p.rect_filled(rect, R_CTRL, HOVER);
@@ -1269,6 +1344,7 @@ impl App {
 
     /// Діалог при закритті вікна під час публікації: лишитись або перервати й вийти.
     fn close_dialog(&mut self, ctx: &egui::Context) {
+        dialog_focus(ctx, "close", self.confirm_close);
         let fid = egui::Id::NULL.with("close_focus_done");
         if !self.confirm_close {
             ctx.data_mut(|d| d.insert_temp(fid, false));
@@ -1439,6 +1515,7 @@ impl App {
 
     /// Питання про однакову назву: об'єднати з наявним проєктом чи створити окремий.
     fn merge_dialog(&mut self, ctx: &egui::Context) {
+        dialog_focus(ctx, "merge", !self.merge_ask.is_empty() && !self.merge_hidden);
         let Some((i, p)) = self.merge_ask.first().cloned() else { return };
         let Some(cur) = self.cfg.projects.get(i).cloned() else {
             self.merge_ask.remove(0); // проєкт зник — питання більше не актуальне
@@ -1523,6 +1600,8 @@ impl App {
     fn tab_button(&mut self, ui: &mut egui::Ui, t: Tab, label: &str) {
         let active = self.tab == t;
         let resp = ui.add(egui::Button::selectable(active, "").frame(false).min_size(egui::vec2(ui.available_width(), 40.0)));
+        let key = match t { Tab::Projects => "Ctrl+1", Tab::Publish => "Ctrl+2", Tab::Settings => "Ctrl+3" };
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, active, format!("{label}, розділ ({key})")));
         let rect = resp.rect;
         let hov = ui.ctx().animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
         let act = ui.ctx().animate_bool_with_time(resp.id.with("act"), active, 0.15);
@@ -1602,7 +1681,7 @@ impl App {
                     ui.spinner();
                     if total > 0 {
                         let f = (done as f32 / total as f32).min(1.0);
-                        ui.add(egui::ProgressBar::new(f).desired_width((ui.available_width() - 56.0).max(60.0)).desired_height(PROG_H).fill(ACCENT).corner_radius(PROG_R).animate(false));
+                        progress_bar(ui, f, (ui.available_width() - 56.0).max(60.0), ACCENT);
                         ui.label(RichText::new(format!("{:.0}%", f * 100.0)).color(MUTED));
                     }
                 });
@@ -1744,12 +1823,13 @@ impl App {
             if n > 1 {
                 ui.horizontal_wrapped(|ui| {
                     if n > 6 {
-                        ui.add(egui::TextEdit::singleline(&mut self.proj_q).hint_text("Пошук за назвою").min_size(egui::vec2(0.0, CTRL_H)).desired_width(260.0_f32.min(ui.available_width() - 8.0)));
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.proj_q).hint_text("Пошук за назвою").min_size(egui::vec2(0.0, CTRL_H)).desired_width(260.0_f32.min(ui.available_width() - 8.0)));
+                        name_edit(&r, "Пошук проєктів", "Пошук за назвою", &self.proj_q);
                     }
-                    if ghost_btn(ui, None, "Сортувати за назвою").on_hover_text("Закріплені першими, далі за алфавітом").clicked() {
+                    if icon_btn(ui, None, "Сортувати за назвою", false).on_hover_text("Закріплені першими, далі за алфавітом").clicked() {
                         sort = true;
                     }
-                    if ghost_btn(ui, None, if self.sel_mode { i18n::tr("btn.done") } else { "Обрати" }).on_hover_text("Обрати кілька проєктів, щоб видалити їх разом").clicked() {
+                    if icon_btn(ui, Some(Ic::Check), if self.sel_mode { i18n::tr("btn.done") } else { "Обрати" }, false).on_hover_text("Обрати кілька проєктів, щоб видалити їх разом").clicked() {
                         self.sel_mode = !self.sel_mode;
                         self.picked.clear();
                         self.batch_confirm = false;
@@ -1783,7 +1863,7 @@ impl App {
                                 ui.horizontal(|ui| {
                                     if sel_mode && !p.id.is_empty() {
                                         let mut on = self.picked.contains(&p.id);
-                                        if check_row(ui, &mut on, "").on_hover_text("Обрати для видалення").changed() {
+                                        if aria_check(check_row(ui, &mut on, "").on_hover_text("Обрати для видалення"), format!("Обрати проєкт «{}» для видалення", p.name), on).changed() {
                                             toggle = Some(p.id.clone());
                                         }
                                     }
@@ -1812,9 +1892,9 @@ impl App {
                                             if ui.add(danger("Точно видалити?")).clicked() { delete = Some(i); }
                                             if ghost_btn(ui, Some(Ic::Cross), i18n::tr("btn.cancel")).clicked() { cancel = true; }
                                         } else {
-                                            if icon_only(ui, Ic::Copy, "Дублювати проєкт: копія з тими самими налаштуваннями", false).clicked() { dup = Some(i); }
-                                            if icon_only(ui, Ic::Pin, if p.pinned { "Відкріпити" } else { "Закріпити: закріплені проєкти йдуть першими" }, p.pinned).clicked() { pin = Some(i); }
-                                            if ui.add_enabled_ui(self.pending == 0 && self.adding == 0, |ui| icon_only(ui, Ic::Trash, "Видалити запис у Modwire", false)).inner.on_disabled_hover_text("Недоступно, поки триває публікація або додавання").clicked() {
+                                            if aria(icon_only(ui, Ic::Copy, "Дублювати проєкт: копія з тими самими налаштуваннями", false), format!("Дублювати проєкт «{}»", p.name)).clicked() { dup = Some(i); }
+                                            if aria_check(icon_only(ui, Ic::Pin, if p.pinned { "Відкріпити" } else { "Закріпити: закріплені проєкти йдуть першими" }, p.pinned), format!("Закріпити проєкт «{}»", p.name), p.pinned).clicked() { pin = Some(i); }
+                                            if ui.add_enabled_ui(self.pending == 0 && self.adding == 0, |ui| aria(icon_only(ui, Ic::Trash, "Видалити запис у Modwire", false), format!("Видалити проєкт «{}» зі списку Modwire", p.name))).inner.on_disabled_hover_text("Недоступно, поки триває публікація або додавання").clicked() {
                                                 ask = Some(i);
                                             }
                                         }
@@ -1885,6 +1965,7 @@ impl App {
     }
 
     fn add_dialog(&mut self, ctx: &egui::Context) {
+        dialog_focus(ctx, "add", self.add_open);
         if !self.add_open {
             self.add_shown = false;
             return;
@@ -2534,7 +2615,7 @@ impl App {
                             };
                         }
                     }
-                    if ghost_btn(ui, None, if res_open { i18n::tr("btn.hide") } else { i18n::tr("btn.details") }).clicked() {
+                    if aria(ghost_btn(ui, None, if res_open { i18n::tr("btn.hide") } else { i18n::tr("btn.details") }), if res_open { "Сховати докладні результати" } else { "Показати докладні результати" }).clicked() {
                         ctx.data_mut(|d| d.insert_temp(res_id, !res_open));
                     }
                 });
@@ -2547,7 +2628,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.allocate_ui_with_layout(egui::vec2(90.0, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| ui.label(RichText::new(*name).color(TEXT)));
                         let tail = if ui.available_width() > 420.0 { 170.0 } else { 56.0 };
-                        ui.add(egui::ProgressBar::new(*f).desired_height(PROG_H).desired_width((ui.available_width() - tail - 8.0).max(60.0)).fill(*col).corner_radius(PROG_R).animate(false));
+                        progress_bar(ui, *f, (ui.available_width() - tail - 8.0).max(60.0), *col);
                         let txt = if tail > 100.0 { format!("{}%{extra}", (f * 100.0) as u32) } else { format!("{}%", (f * 100.0) as u32) };
                         ui.label(RichText::new(txt).color(MUTED).size(HINT_SZ));
                     });
@@ -2580,7 +2661,7 @@ impl App {
                             let open = ctx.data_mut(|d| d.get_temp::<bool>(det_id)).unwrap_or(false);
                             ui.horizontal_wrapped(|ui| {
                                 icon_label_c(ui, Ic::Cross, ERROR, &format!("{name}: помилка. {short}{}", if long { "…" } else { "" }), TEXT);
-                                if long && ghost_btn(ui, None, if open { i18n::tr("btn.hide") } else { i18n::tr("btn.details") }).clicked() {
+                                if long && aria(ghost_btn(ui, None, if open { i18n::tr("btn.hide") } else { i18n::tr("btn.details") }), format!("{} текст помилки {name}", if open { "Сховати" } else { "Показати" })).clicked() {
                                     ctx.data_mut(|d| d.insert_temp(det_id, !open));
                                 }
                             });
@@ -2719,7 +2800,8 @@ impl App {
                 let total = found.len();
                 egui::CollapsingHeader::new(title(format!("Історія · {}", self.history.len()))).default_open(true).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.hist_q).hint_text("Пошук: проєкт, номер, платформа, текст").min_size(egui::vec2(0.0, CTRL_H)).desired_width(260.0_f32.min(ui.available_width() - 8.0)));
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.hist_q).hint_text("Пошук: проєкт, номер, платформа, текст").min_size(egui::vec2(0.0, CTRL_H)).desired_width(340.0_f32.min(ui.available_width() - 8.0)));
+                        name_edit(&r, "Пошук в історії публікацій", "Пошук: проєкт, номер, платформа, текст", &self.hist_q);
                         if choice(ui, self.hist_fail, "Лише помилки").clicked() { self.hist_fail = !self.hist_fail; }
                         if self.hist_confirm {
                             if ui.add(danger("Так, очистити історію")).clicked() {
@@ -2931,7 +3013,7 @@ impl App {
                     *changed = true;
                 }
                 ui.horizontal(|ui| {
-                    if ui.add_enabled_ui(self.check_msg != Chk::Checking, |ui| icon_btn(ui, Some(Ic::Check), if self.check_msg == Chk::Checking { i18n::tr("status.checking") } else { i18n::tr("btn.check") }, false)).inner.clicked() {
+                    if ui.add_enabled_ui(self.check_msg != Chk::Checking, |ui| aria(icon_btn(ui, Some(Ic::Check), if self.check_msg == Chk::Checking { i18n::tr("status.checking") } else { i18n::tr("btn.check") }, false), "Перевірити токен Modrinth")).inner.clicked() {
                         let t = self.cfg.modrinth_token.trim().to_string();
                         if t.is_empty() {
                             self.check_msg = Chk::Err("Спершу вставте токен".into());
@@ -2959,7 +3041,7 @@ impl App {
                     *changed = true;
                 }
                 ui.horizontal(|ui| {
-                    if ui.add_enabled_ui(self.cf_msg != Chk::Checking, |ui| icon_btn(ui, Some(Ic::Check), if self.cf_msg == Chk::Checking { i18n::tr("status.checking") } else { i18n::tr("btn.check") }, false)).inner.clicked() {
+                    if ui.add_enabled_ui(self.cf_msg != Chk::Checking, |ui| aria(icon_btn(ui, Some(Ic::Check), if self.cf_msg == Chk::Checking { i18n::tr("status.checking") } else { i18n::tr("btn.check") }, false), "Перевірити токен CurseForge")).inner.clicked() {
                         let t = self.cfg.curse_token.trim().to_string();
                         if t.is_empty() {
                             self.cf_msg = Chk::Err("Спершу вставте токен".into());
@@ -2985,7 +3067,7 @@ impl App {
                     *changed = true;
                 }
                 ui.horizontal(|ui| {
-                    if ui.add_enabled_ui(self.key_msg != Chk::Checking, |ui| icon_btn(ui, Some(Ic::Check), if self.key_msg == Chk::Checking { i18n::tr("status.checking") } else { i18n::tr("btn.check") }, false)).inner.clicked() {
+                    if ui.add_enabled_ui(self.key_msg != Chk::Checking, |ui| aria(icon_btn(ui, Some(Ic::Check), if self.key_msg == Chk::Checking { i18n::tr("status.checking") } else { i18n::tr("btn.check") }, false), "Перевірити Core API-ключ")).inner.clicked() {
                         let k = self.cfg.curse_core_key.trim().to_string();
                         if k.is_empty() {
                             self.key_msg = Chk::Err("Спершу вставте ключ".into());
@@ -3010,6 +3092,11 @@ impl App {
                 self.upd_checking = true;
                 self.upd_err.clear();
                 self.spawn(ctx, || Msg::Update(check_update(), true));
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Гарячі клавіші (F1 відкриває цей розділ)").color(TEXT).strong().size(14.0));
+            for line in ["Ctrl+1, Ctrl+2, Ctrl+3: Проєкти, Публікація, Налаштування", "Ctrl+Enter: опублікувати, коли форму заповнено", "Tab / Shift+Tab: перехід між елементами, Пробіл або Enter: натиснути", "Esc: закрити діалог чи скасувати видалення"] {
+                hint(ui, line);
             }
             if let Some(url) = ads::DONATE_URL {
                 ui.add_space(8.0);
@@ -3252,6 +3339,9 @@ impl eframe::App for App {
                 self.tab = t; // Ctrl+1/2/3
             }
         }
+        if !self.add_open && self.merge_ask.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            self.tab = Tab::Settings; // F1: довідка про гарячі клавіші в «Про застосунок»
+        }
         // Ctrl+Enter: з іншого розділу лише відкриває «Публікацію» (щоб побачити підсумок), там уже публікує (якщо форма готова і немає діалогу)
         if self.splash.done() && self.pending == 0 && !self.add_open && self.merge_ask.is_empty() && !self.cfg.projects.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) {
             let proj = self.sel.and_then(|i| self.cfg.projects.get(i));
@@ -3278,6 +3368,8 @@ impl eframe::App for App {
         // Нижня панель займає місце зараз (висота — з минулого кадру), а її віджети створюються ПІСЛЯ форми:
         // egui веде Tab за порядком створення віджетів, тож форма фокусується раніше за кнопку «Опублікувати».
         let bar_id = egui::Id::NULL.with("publish_bar_h");
+        let rail_w = if ctx.content_rect().width() < 860.0 { RAIL_W - 16.0 } else { RAIL_W };
+        let side = ((ctx.content_rect().width() - rail_w - CONTENT_MAX_W) / 2.0).max(24.0).floor();
         let pad_y = if ctx.content_rect().height() < 600.0 { 6.0 } else { 10.0 }; // низьке вікно: панель ≤30% висоти
         let bar_rect = (self.tab == Tab::Publish && !self.cfg.projects.is_empty()).then(|| {
             let h = ctx.data_mut(|d| d.get_temp::<f32>(bar_id)).unwrap_or(64.0);
@@ -3289,6 +3381,10 @@ impl eframe::App for App {
                 .rect
         });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(24))).show(root, |ui| {
+            // широке вікно: колонка контенту по центру (поле Margin — i8, тому звужуємо вручну)
+            let inner = ui.max_rect().shrink2(egui::vec2(side - 24.0, 0.0));
+            let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+            let ui = &mut ui;
             // м'яка поява вмісту при зміні розділу (150 мс)
             let cur = self.tab as u8;
             let (epoch, switched) = ctx.data_mut(|d| {
@@ -3306,7 +3402,7 @@ impl eframe::App for App {
             Tab::Settings => self.settings_ui(ui, ctx),
         } });
         if let Some(r) = bar_rect {
-            let mut bar = root.new_child(egui::UiBuilder::new().max_rect(r.shrink2(egui::vec2(24.0, pad_y))).layout(egui::Layout::top_down(egui::Align::Min)));
+            let mut bar = root.new_child(egui::UiBuilder::new().max_rect(r.shrink2(egui::vec2(side, pad_y))).layout(egui::Layout::top_down(egui::Align::Min)));
             bar.set_clip_rect(r);
             self.publish_bar(&mut bar, ctx);
             let h = bar.min_rect().height() + 2.0 * pad_y;
@@ -3610,6 +3706,210 @@ mod tests {
             eprintln!("{:?}: repaint_delay у простої = {last:?}", tab as u8);
             assert!(last >= std::time::Duration::from_secs(1), "{:?} просить кадр кожні {last:?}", tab as u8);
         }
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    /// Дерево accesskit за кілька кадрів: (роль, назва) кожного інтерактивного вузла без назви.
+    fn unnamed_nodes(app: &mut App, show: &mut dyn FnMut(&mut App, &mut egui::Ui, &egui::Context)) -> Vec<String> {
+        use egui::accesskit::Role;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        setup_style(&ctx);
+        let mut nodes = std::collections::HashMap::new();
+        for _ in 0..4 {
+            let (out, _) = frame(&ctx, vec![], &mut |ui| {
+                let c = ui.ctx().clone();
+                show(app, ui, &c);
+            });
+            if let Some(u) = out.platform_output.accesskit_update {
+                nodes.extend(u.nodes);
+            }
+        }
+        let mut bad = vec![];
+        let mut names: Vec<String> = nodes.values().filter(|n| matches!(n.role(), Role::Button | Role::CheckBox | Role::TextInput | Role::MultilineTextInput | Role::ComboBox)).map(|n| format!("{:?}: {}", n.role(), n.label().or(n.value()).unwrap_or(""))).collect();
+        names.sort();
+        eprintln!("{}", names.join(" | "));
+        for (id, n) in &nodes {
+            if !matches!(n.role(), Role::Button | Role::CheckBox | Role::TextInput | Role::MultilineTextInput | Role::ComboBox | Role::Link | Role::RadioButton | Role::Switch) {
+                continue;
+            }
+            let named = n.label().is_some_and(|l| !l.trim().is_empty())
+                || n.value().is_some_and(|l| !l.trim().is_empty())
+                || n.description().is_some_and(|l| !l.trim().is_empty())
+                || n.labelled_by().iter().any(|l| nodes.get(l).is_some_and(|ln| ln.label().or(ln.value()).is_some_and(|t| !t.trim().is_empty())));
+            if !named {
+                bad.push(format!("{:?} {:?} (id {:?})", n.role(), n.label(), id));
+            }
+        }
+        assert!(nodes.values().any(|n| n.role() == Role::Button), "дерево accesskit порожнє: enable_accesskit не спрацював");
+        bad
+    }
+
+    fn page(app: &mut App, ui: &mut egui::Ui, c: &egui::Context, tab: Tab) {
+        egui::CentralPanel::default().show(ui, |ui| match tab {
+            Tab::Projects => app.projects_ui(ui, c),
+            Tab::Publish => app.publish_ui(ui, c),
+            Tab::Settings => app.settings_ui(ui, c),
+        });
+    }
+
+    #[test]
+    fn every_interactive_node_has_a_name() {
+        let (_g, mut app) = test_app("a11y");
+        app.sel = Some(0);
+        app.history = vec![
+            serde_json::json!({"ok": true, "project": "a", "number": "1.0", "platform": "Modrinth", "t": 1, "msg": "https://modrinth.com/mod/a/version/1"}),
+            serde_json::json!({"ok": false, "project": "a", "number": "1.1", "platform": "CurseForge", "t": 2, "msg": "403"}),
+        ];
+        app.mr_res = Some(Ok("Опубліковано: https://modrinth.com/mod/a/version/1".into()));
+        app.cf_res = Some(Err("Сервер відповів HTTP 403. Перевірте токен".into()));
+        let mut bad = vec![];
+        for tab in [Tab::Projects, Tab::Publish, Tab::Settings] {
+            for sel_mode in [false, true] {
+                app.sel_mode = sel_mode;
+                app.confirm_del = (tab == Tab::Projects && !sel_mode).then_some(0);
+                let b = unnamed_nodes(&mut app, &mut |a, ui, c| {
+                    a.rail(ui);
+                    page(a, ui, c, tab);
+                    if tab == Tab::Publish {
+                        a.publish_bar(ui, c);
+                    }
+                });
+                bad.extend(b.into_iter().map(|x| format!("{:?}/sel={sel_mode}: {x}", tab as u8)));
+            }
+        }
+        app.sel_mode = false;
+        app.confirm_del = None;
+        app.add_open = true;
+        bad.extend(unnamed_nodes(&mut app, &mut |a, ui, c| { page(a, ui, c, Tab::Projects); a.add_dialog(c); }).into_iter().map(|x| format!("add: {x}")));
+        app.add_open = false;
+        app.confirm_close = true;
+        bad.extend(unnamed_nodes(&mut app, &mut |a, ui, c| { page(a, ui, c, Tab::Projects); a.close_dialog(c); }).into_iter().map(|x| format!("close: {x}")));
+        app.confirm_close = false;
+        app.merge_ask = vec![(0, app.cfg.projects[1].clone())];
+        bad.extend(unnamed_nodes(&mut app, &mut |a, ui, c| { page(a, ui, c, Tab::Projects); a.merge_dialog(c); }).into_iter().map(|x| format!("merge: {x}")));
+        app.merge_ask.clear();
+        app.start_act = StartAction::OfferRollback;
+        bad.extend(unnamed_nodes(&mut app, &mut |a, ui, c| { page(a, ui, c, Tab::Projects); a.update_guard(c); }).into_iter().map(|x| format!("rollback: {x}")));
+        app.start_act = StartAction::Clean;
+        app.cfg.projects.clear();
+        bad.extend(unnamed_nodes(&mut app, &mut |a, ui, c| { a.rail(ui); page(a, ui, c, Tab::Projects); }).into_iter().map(|x| format!("empty: {x}")));
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+        assert!(bad.is_empty(), "вузли без назви:
+{}", bad.join("
+"));
+    }
+
+    /// Послідовність Tab: (назва з accesskit, верх, ліво) кожного елемента у фокусі; перший елемент — фокус до першого Tab.
+    /// Кожен виклик має власний Context: без спільного стану між тестами.
+    fn tab_order(app: &mut App, presses: usize, show: &mut dyn FnMut(&mut App, &mut egui::Ui, &egui::Context)) -> Vec<(String, f32, f32)> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        setup_style(&ctx);
+        let mut nodes = std::collections::HashMap::new();
+        let mut run = |app: &mut App, ev: Vec<egui::Event>| {
+            let (out, f) = frame(&ctx, ev, &mut |ui| {
+                let c = ui.ctx().clone();
+                show(app, ui, &c);
+            });
+            if let Some(u) = out.platform_output.accesskit_update {
+                nodes.extend(u.nodes);
+            }
+            f
+        };
+        let mut ids = vec![];
+        for _ in 0..3 {
+            if let Some(id) = run(app, vec![]) {
+                ids = vec![id];
+            }
+        }
+        for _ in 0..presses {
+            if let Some(id) = run(app, tab_key()) {
+                ids.push(id);
+            }
+        }
+        ids.into_iter()
+            .filter_map(|id| {
+                let r = ctx.read_response(id)?;
+                let n = nodes.get(&id.accesskit_id());
+                let named = |n: &egui::accesskit::Node| n.label().or(n.value()).filter(|t| !t.is_empty()).map(str::to_string);
+                let name = n.and_then(named).or_else(|| n?.labelled_by().iter().find_map(|l| nodes.get(l).and_then(named))).unwrap_or_default();
+                Some((name, r.rect.top(), r.rect.left()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tab_order_projects_and_publish_is_visual() {
+        let (_g, mut app) = test_app("taborder");
+        app.sel = Some(0);
+        for tab in [Tab::Projects, Tab::Publish] {
+            app.tab = tab;
+            let seq = tab_order(&mut app, 40, &mut |a, ui, c| {
+                a.rail(ui);
+                page(a, ui, c, tab);
+                if tab == Tab::Publish {
+                    a.publish_bar(ui, c);
+                }
+            });
+            eprintln!("{:?}: {}", tab as u8, seq.iter().map(|s| format!("{}@{:.0},{:.0}", s.0, s.1, s.2)).collect::<Vec<_>>().join(" > "));
+            assert!(seq.len() > 8, "{:?}: фокус не рухається ({} елементів)", tab as u8, seq.len());
+            assert!(seq.iter().all(|s| !s.0.is_empty()), "{:?}: елемент у фокусі без назви: {seq:?}", tab as u8);
+            // після рейки (3 пункти) форма йде зверху вниз; нижня панель публікації — завжди останньою перед колом
+            let cycle = seq[1..].iter().position(|s| s.0 == seq[0].0).map_or(seq.len(), |i| i + 1);
+            let end = if tab == Tab::Publish { cycle - 1 } else { cycle };
+            let tops: Vec<f32> = seq[3..end].iter().map(|s| s.1).collect();
+            assert!(tops.windows(2).all(|w| w[0] <= w[1] + 1.0), "{:?}: порядок Tab не збігається з візуальним: {seq:?}", tab as u8);
+        }
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    #[test]
+    fn focus_returns_to_opener_after_dialog_closes() {
+        let (_g, mut app) = test_app("focusret");
+        app.tab = Tab::Projects;
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        let run = |app: &mut App, ev: Vec<egui::Event>| {
+            frame(&ctx, ev, &mut |ui| {
+                let c = ui.ctx().clone();
+                page(app, ui, &c, Tab::Projects);
+                app.add_dialog(&c);
+            })
+            .1
+        };
+        for _ in 0..2 { run(&mut app, vec![]); }
+        let opener = (0..3).find_map(|_| run(&mut app, tab_key())).expect("є що фокусувати на сторінці");
+        app.add_open = true;
+        for _ in 0..4 { run(&mut app, vec![]); }
+        assert_ne!(run(&mut app, vec![]), Some(opener), "у діалозі фокус має бути всередині діалогу");
+        app.add_open = false;
+        for _ in 0..3 { run(&mut app, vec![]); }
+        assert_eq!(run(&mut app, vec![]), Some(opener), "після закриття діалогу фокус повертається на елемент, що його відкрив");
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    /// Статуси результатів мають слова для скрінрідера: «Успішно»/«Помилка», а не лише значки ✓/✕.
+    #[test]
+    fn result_status_icons_are_spoken() {
+        let (_g, mut app) = test_app("spoken");
+        app.sel = Some(0);
+        app.mr_res = Some(Ok("Опубліковано: https://modrinth.com/mod/a/version/1".into()));
+        app.cf_res = Some(Err("Сервер відповів HTTP 403".into()));
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        setup_style(&ctx);
+        let mut labels = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let (out, _) = frame(&ctx, vec![], &mut |ui| {
+                let c = ui.ctx().clone();
+                app.publish_bar(ui, &c);
+            });
+            for (_, n) in out.platform_output.accesskit_update.into_iter().flat_map(|u| u.nodes) {
+                labels.extend(n.label().map(str::to_string));
+            }
+        }
+        assert!(labels.contains("Успішно") && labels.contains("Помилка"), "{labels:?}");
         unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
     }
 }

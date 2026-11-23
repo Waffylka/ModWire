@@ -1318,10 +1318,11 @@ fn sent_err(e: reqwest::Error) -> String {
     format!("{e}. Файл міг бути завантажений — перевірте на сайті перед повтором")
 }
 
-const NET_ADVICE: &str = "Немає зв'язку з сервером (мережа або таймаут). Перевірте інтернет, VPN чи брандмауер і спробуйте ще раз.";
+const NET_ADVICE: &str = "Немає зв'язку з сервером (мережа або таймаут). Перевірте інтернет, VPN, проксі чи брандмауер і спробуйте ще раз.";
 
 fn net_err(e: reqwest::Error) -> String {
-    if e.is_timeout() || e.is_connect() || e.is_body() || e.is_decode() {
+    // is_request: з'єднання закрито/скинуто посеред запиту; проксі, що не відповідає, дає is_connect
+    if e.is_timeout() || e.is_connect() || e.is_body() || e.is_decode() || e.is_request() {
         format!("{NET_ADVICE} ({e})")
     } else {
         e.to_string()
@@ -1336,10 +1337,18 @@ fn api_msg(body: &str) -> String {
     m
 }
 
+const MAX_BODY: u64 = 20 * 1024 * 1024;
+
 fn json_of(resp: reqwest::blocking::Response) -> Result<Value, String> {
     let st = resp.status();
     let retry = resp.headers().get("retry-after").and_then(|h| h.to_str().ok()).map(str::to_string);
-    let body = resp.text().map_err(net_err)?;
+    // відповідь читаємо з обмеженням: збійний проксі/сервер не має з'їсти пам'ять
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(resp, MAX_BODY + 1), &mut buf).map_err(|e| format!("{NET_ADVICE} ({e})"))?;
+    if buf.len() as u64 > MAX_BODY {
+        return Err("Відповідь сервера завелика: схоже на збій сервісу чи сторінку проксі. Спробуйте пізніше".into());
+    }
+    let body = String::from_utf8_lossy(&buf).into_owned();
     if !st.is_success() {
         let wait = retry.filter(|_| st.as_u16() == 429).map_or(String::new(), |s| format!(" Зачекайте {s} с."));
         return Err(format!("{}.{wait} (HTTP {st}: {})", human(st), api_msg(&body)));
@@ -1352,13 +1361,17 @@ fn get_json(c: &Client, url: &str, header: (&str, &str)) -> Result<Value, String
     let pause = Duration::from_millis(if cfg!(test) { 10 } else { 1500 });
     for attempt in 0..3 {
         let last = attempt == 2;
+        let mut wait = None;
         match c.get(url).header(header.0, header.1).send() {
-            Ok(r) if !last && (r.status().as_u16() == 429 || r.status().is_server_error()) => {}
+            Ok(r) if !last && (r.status().as_u16() == 429 || r.status().is_server_error()) => {
+                // Retry-After сервера поважаємо, але не довше 10 с: це фоновий запит, за яким чекає користувач
+                wait = r.headers().get("retry-after").and_then(|h| h.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok()).map(|s| Duration::from_secs(s.min(10)));
+            }
             Ok(r) => return json_of(r),
-            Err(e) if !last && (e.is_timeout() || e.is_connect()) => {}
+            Err(e) if !last && (e.is_timeout() || e.is_connect() || e.is_request()) => {}
             Err(e) => return Err(net_err(e)),
         }
-        std::thread::sleep(pause * (attempt + 1));
+        std::thread::sleep(if cfg!(test) { pause * (attempt + 1) } else { wait.unwrap_or(pause * (attempt + 1)) });
     }
     unreachable!()
 }
@@ -1693,6 +1706,7 @@ pub const UPDATE_REPO: &str = "Waffylka/ModWire";
 const UPDATE_ASSET: &str = "modwire.exe";
 const UPDATE_MAX: u64 = 200 * 1024 * 1024;
 
+#[derive(Debug)]
 pub struct Update {
     pub version: String,
     /// Пряме посилання на файл для Windows; порожнє, якщо в релізі його немає (тоді відкриваємо сторінку).
@@ -1768,7 +1782,15 @@ fn check_repo(repo: &str) -> Result<Option<Update>, String> {
         return Ok(None);
     }
     let c = client_open(20)?;
-    let v = get_json(&c, &format!("https://api.github.com/repos/{repo}/releases/latest"), ("accept", "application/vnd.github+json"))?;
+    let v = match get_json(&c, &format!("{}/repos/{repo}/releases/latest", base("https://api.github.com")), ("accept", "application/vnd.github+json")) {
+        Ok(v) => v,
+        // GitHub віддає 404, поки в репозиторії немає жодного релізу: оновлень просто немає
+        Err(e) if e.contains("(HTTP 404") => return Ok(None),
+        Err(e) if e.contains("(HTTP 403") || e.contains("(HTTP 429") => {
+            return Err("GitHub тимчасово обмежив кількість запитів із вашої адреси. Спробуйте за годину або завантажте нову версію зі сторінки релізів".into());
+        }
+        Err(e) => return Err(e),
+    };
     Ok(parse_release(&v, repo, env!("CARGO_PKG_VERSION")))
 }
 
@@ -1983,14 +2005,18 @@ pub fn apply_update(url: &str, size: u64, sha256: &str) -> Result<(), String> {
     if !trusted_url(url, UPDATE_REPO) {
         return Err("Недовірена адреса оновлення".into());
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    apply_at(&std::env::current_exe().map_err(|e| e.to_string())?, url, size, sha256)
+}
+
+/// Те саме для довільного `exe` (у тестах це тимчасова копія, а не працюючий файл); адресу тут уже не перевіряємо.
+fn apply_at(exe: &Path, url: &str, size: u64, sha256: &str) -> Result<(), String> {
     let (new, old) = (exe.with_extension("exe.new"), exe.with_extension("exe.old"));
     check_writable(exe.parent().ok_or("немає теки програми")?)?;
     if UPDATING.swap(true, Relaxed) {
         return Err("Оновлення вже виконується".into());
     }
     clear_update_marker();
-    let res = download_to(url, &new, size).and_then(|()| install(&exe, &new, &old, sha256));
+    let res = download_to(url, &new, size).and_then(|()| install(exe, &new, &old, sha256));
     UPDATING.store(false, Relaxed);
     res
 }
@@ -2358,7 +2384,8 @@ mod tests {
                 }
                 let body_text = String::from_utf8_lossy(&buf[head_end.min(buf.len())..]).into_owned();
                 let line = head.lines().next().unwrap_or("").to_string();
-                let (code, body) = routes.iter().find(|(k, _, _)| line.starts_with(k)).map_or((404, "{}"), |r| (r.1, r.2));
+                let hit = routes.iter().find(|(k, _, _)| line.starts_with(k));
+                let (code, body) = hit.map_or((404, "{}"), |r| (r.1, r.2));
                 let _ = write!(s, "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 seen.push(format!("{head}{body_text}"));
             }
@@ -2853,6 +2880,136 @@ mod tests {
         assert!(r.unwrap_err().contains("не повністю") && !dest.exists());
     }
 
+    /// Тека даних оновлення (update.ok) підміняється на тимчасову, щоб тест не чіпав справжній маркер користувача.
+    /// Береться після SERIAL (порядок SERIAL -> ENV_LOCK, як в інших тестах) і знімає змінну навіть при паніці.
+    struct CfgEnv<'a> {
+        _lock: std::sync::MutexGuard<'a, ()>,
+    }
+    impl CfgEnv<'_> {
+        fn set(dir: &Path) -> Self {
+            let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // shortcut: set_var глобальний; усі тести з env беруть ENV_LOCK
+            unsafe { std::env::set_var("MODWIRE_CONFIG_DIR", dir) };
+            Self { _lock: g }
+        }
+    }
+    impl Drop for CfgEnv<'_> {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+        }
+    }
+
+    fn fake_exe_body(sig: &str) -> &'static str {
+        Box::leak(format!("{sig}{}", "x".repeat(1_200_000)).into_boxed_str())
+    }
+
+    fn sha_hex(s: &str) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Фальшивий exe для оновлення: ціль заміни завжди тимчасова копія, не працюючий файл тесту.
+    fn upd_exe(tag: &str) -> (PathBuf, PathBuf) {
+        let d = tmp_dir(tag);
+        std::fs::write(d.join("modwire.exe"), b"v1-good").unwrap();
+        (d.clone(), d.join("modwire.exe"))
+    }
+
+    #[test]
+    fn update_full_chain_on_mock_github() {
+        let (d, exe) = upd_exe("upd_chain");
+        let body = fake_exe_body("MZ");
+        let sum = sha_hex(body);
+        let rel: &'static str = Box::leak(
+            json!({"tag_name":"v99.0.0","html_url":"https://github.com/Waffylka/ModWire/releases/tag/v99.0.0","assets":[
+                {"name":"modwire.exe","size":body.len(),"digest":format!("sha256:{sum}"),
+                 "browser_download_url":"https://github.com/Waffylka/ModWire/releases/download/v99.0.0/modwire.exe"}]})
+            .to_string()
+            .into_boxed_str(),
+        );
+        let (r, seen) = with_mock_secs(2, vec![("GET /repos/Waffylka/ModWire/releases/latest", 200, rel), ("GET /file", 200, body)], 90, || {
+            let _e = CfgEnv::set(&d.join("cfg"));
+            let u = check_repo(UPDATE_REPO).unwrap().expect("новіший реліз знайдено");
+            assert_eq!((u.version.as_str(), u.size, u.sha256.as_str()), ("99.0.0", body.len() as u64, sum.as_str()));
+            assert!(trusted_url(&u.url, UPDATE_REPO), "посилання з релізу довірене");
+            // старий маркер не має приховувати проблему нової збірки
+            std::fs::create_dir_all(d.join("cfg")).unwrap();
+            std::fs::write(d.join("cfg").join("update.ok"), b"ok").unwrap();
+            // завантажуємо з mock (на github.com тест не ходить), решта ланцюга справжня
+            let url = format!("{}/file", TEST_BASE.lock().unwrap().clone().unwrap());
+            apply_at(&exe, &url, u.size, &u.sha256)?;
+            assert!(!d.join("cfg").join("update.ok").exists());
+            assert_eq!(update_progress().0, body.len() as u64);
+            assert_eq!(std::fs::read(&exe).unwrap().len(), body.len(), "exe замінено новим");
+            assert_eq!(std::fs::read(exe.with_extension("exe.old")).unwrap(), b"v1-good");
+            // нова збірка пропрацювала STABLE_SECS: маркер є, .old прибрано
+            confirm_update_at(&exe);
+            assert!(d.join("cfg").join("update.ok").exists() && !exe.with_extension("exe.old").exists());
+            Ok::<(), String>(())
+        });
+        r.unwrap();
+        assert!(seen[0].to_lowercase().contains("accept: application/vnd.github+json") && seen[1].starts_with("GET /file"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn update_broken_downloads_leave_exe_intact() {
+        let good = fake_exe_body("MZ");
+        let good_sum = sha_hex(good);
+        let pk = fake_exe_body("PK");
+        let n = good.len() as u64;
+        // (тіло, заявлений розмір, digest, що має бути в помилці)
+        let cases: Vec<(&'static str, u64, String, &str)> = vec![
+            (good, n, "0".repeat(64), "Контрольна сума"),
+            (pk, n, String::new(), "не є програмою"),
+            (good, n - 10, good_sum.clone(), "не повністю"),
+            (good, n + 10, good_sum.clone(), "не повністю"),
+            ("MZ-tiny", 0, String::new(), "не є програмою"),
+        ];
+        for (i, (body, size, sum, want)) in cases.into_iter().enumerate() {
+            let (d, exe) = upd_exe(&format!("upd_bad{i}"));
+            let (r, _) = with_mock_secs(1, vec![("GET /file", 200, body)], 90, || {
+                let _e = CfgEnv::set(&d.join("cfg"));
+                let url = format!("{}/file", TEST_BASE.lock().unwrap().clone().unwrap());
+                apply_at(&exe, &url, size, &sum)
+            });
+            let e = r.unwrap_err();
+            assert!(e.contains(want), "випадок {i}: «{e}»");
+            assert_eq!(std::fs::read(&exe).unwrap(), b"v1-good", "випадок {i}: exe не чіпали");
+            assert!(!exe.with_extension("exe.new").exists() && !exe.with_extension("exe.old").exists(), "випадок {i}: без сміття");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        // сервер віддає 404 замість файлу
+        let (d, exe) = upd_exe("upd_404");
+        let (r, _) = with_mock_secs(1, vec![("GET /file", 404, "{}")], 90, || {
+            let _e = CfgEnv::set(&d.join("cfg"));
+            apply_at(&exe, &format!("{}/file", TEST_BASE.lock().unwrap().clone().unwrap()), 0, "")
+        });
+        assert!(r.unwrap_err().contains("404") && std::fs::read(&exe).unwrap() == b"v1-good");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn update_check_handles_github_errors_and_missing_asset() {
+        // ліміт запитів GitHub: зрозуміле повідомлення, не «немає доступу до проєкту»
+        let rate = r#"{"message":"API rate limit exceeded for 1.2.3.4."}"#;
+        let (r, _) = with_mock(1, vec![("GET /repos/", 403, rate)], || check_repo(UPDATE_REPO));
+        let e = r.unwrap_err();
+        assert!(e.contains("обмежив") && !e.contains("проєкту"), "{e}");
+        // 404: у репозиторії ще немає релізів: оновлень немає, не помилка
+        let (r, _) = with_mock(1, vec![("GET /repos/", 404, r#"{"message":"Not Found"}"#)], || check_repo(UPDATE_REPO));
+        assert!(r.unwrap().is_none());
+        // не JSON (сторінка проксі)
+        let (r, _) = with_mock(1, vec![("GET /repos/", 200, "<html>proxy</html>")], || check_repo(UPDATE_REPO));
+        assert!(r.is_err());
+        // реліз без файлу для Windows або з чужою адресою: url порожній, сторінка релізу лишається
+        let none = json!({"tag_name":"v99.0.0","assets":[{"name":"Modwire.dmg","size":1,"browser_download_url":"https://github.com/Waffylka/ModWire/releases/download/v99.0.0/Modwire.dmg"}]});
+        let u = parse_release(&none, UPDATE_REPO, "0.3.0").unwrap();
+        assert!(u.url.is_empty() && u.page.starts_with("https://github.com/"));
+        let evil = json!({"tag_name":"v99.0.0","assets":[{"name":"modwire.exe","size":1,"browser_download_url":"https://evil.example/releases/download/v99.0.0/modwire.exe"}]});
+        assert!(parse_release(&evil, UPDATE_REPO, "0.3.0").unwrap().url.is_empty());
+    }
+
     #[test]
     fn every_error_code_has_advice() {
         let advice = ["Перевірте", "Створіть", "Зачекайте", "Змініть", "Оберіть", "Повторіть", "повторіть", "спробуйте"];
@@ -3182,8 +3339,9 @@ mod tests {
         // не exe: те саме
         std::fs::write(&new, b"PK-not-exe").unwrap();
         assert!(install(&exe, &new, &old, "").is_err() && !new.exists());
-        // повторний запуск оновлення
+        // повторний запуск оновлення (замок: прапорець UPDATING глобальний, його читають і тести ланцюга)
         if cfg!(windows) {
+            let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
             UPDATING.store(true, Relaxed);
             let r = apply_update("https://github.com/Waffylka/ModWire/releases/download/v9.9.9/modwire.exe", 0, "");
             UPDATING.store(false, Relaxed);
@@ -3726,5 +3884,91 @@ Content-Length: 1000
         let e = get_json(&c, &url, ("x", "y")).unwrap_err();
         h.join().unwrap();
         assert!(e.contains("Немає зв'язку"), "{e}");
+    }
+
+    /// Сирий сервер: на кожне з'єднання одна дія (відповідь байтами, пауза перед нею або обрив без відповіді).
+    fn raw_server(acts: Vec<(u64, Option<Vec<u8>>)>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let h = std::thread::spawn(move || {
+            for (delay, resp) in acts {
+                let Ok((mut s, _)) = l.accept() else { return };
+                let mut b = [0u8; 2048];
+                let _ = s.read(&mut b);
+                std::thread::sleep(Duration::from_millis(delay));
+                if let Some(r) = resp {
+                    let _ = s.write_all(&r);
+                }
+            }
+        });
+        (url, h)
+    }
+
+    fn http(code: u16, extra: &str, body: &str) -> Option<Vec<u8>> {
+        Some(format!("HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len()).into_bytes())
+    }
+
+    #[test]
+    fn get_retries_5xx_with_retry_after_and_429_then_succeeds() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (url, h) = raw_server(vec![(0, http(503, "Retry-After: 1\r\n", "{}")), (0, http(429, "", "{}")), (0, http(200, "", "{\"ok\":1}"))]);
+        let v = get_json(&client_t(5).unwrap(), &url, ("x", "y")).unwrap();
+        h.join().unwrap();
+        assert_eq!(v["ok"], 1);
+    }
+
+    #[test]
+    fn get_gives_clear_error_after_persistent_5xx() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (url, h) = raw_server(vec![(0, http(502, "", "{}")), (0, http(502, "", "{}")), (0, http(502, "", "{}"))]);
+        let e = get_json(&client_t(5).unwrap(), &url, ("x", "y")).unwrap_err();
+        h.join().unwrap();
+        assert!(e.contains("Сервіс тимчасово недоступний") && e.contains("502"), "{e}");
+    }
+
+    #[test]
+    fn get_closed_connection_gets_network_advice() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (url, h) = raw_server(vec![(0, None), (0, None), (0, None)]);
+        let e = get_json(&client_t(5).unwrap(), &url, ("x", "y")).unwrap_err();
+        h.join().unwrap();
+        assert!(e.contains("Немає зв'язку"), "{e}");
+    }
+
+    #[test]
+    fn get_slow_response_times_out_with_advice() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (url, h) = raw_server(vec![(2500, None), (2500, None), (2500, None)]);
+        let e = get_json(&client_t(1).unwrap(), &url, ("x", "y")).unwrap_err();
+        h.join().unwrap();
+        assert!(e.contains("Немає зв'язку"), "{e}");
+    }
+
+    #[test]
+    fn invalid_json_and_oversized_body_are_reported() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (url, h) = raw_server(vec![(0, http(200, "", "<html>proxy login</html>"))]);
+        let e = get_json(&client_t(5).unwrap(), &url, ("x", "y")).unwrap_err();
+        h.join().unwrap();
+        assert!(e.contains("Сервер повернув не те"), "{e}");
+        let big = "x".repeat(MAX_BODY as usize + 10);
+        let (url, h) = raw_server(vec![(0, http(200, "", &big))]);
+        let e = get_json(&client_t(10).unwrap(), &url, ("x", "y")).unwrap_err();
+        h.join().unwrap();
+        assert!(e.contains("завелика"), "{e}");
+    }
+
+    #[test]
+    fn dead_proxy_gives_network_advice() {
+        let c = reqwest::blocking::Client::builder().proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap()).timeout(Duration::from_secs(5)).build().unwrap();
+        let e = net_err(c.get("http://example.invalid/").send().unwrap_err());
+        assert!(e.contains("проксі") && e.contains("Немає зв'язку"), "{e}");
+    }
+
+    #[test]
+    fn game_versions_failure_is_a_clean_error_not_a_panic() {
+        let (r, _) = with_mock(1, vec![("GET /v2/tag/game_version", 200, "not json")], game_versions);
+        assert!(r.unwrap_err().contains("Сервер повернув не те"));
     }
 }

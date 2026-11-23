@@ -47,6 +47,19 @@ const SCENES: &[(&str, f32, f32)] = &[
     ("rollback_dialog", 900.0, 580.0),
     ("history_big", 900.0, 580.0), ("history_empty", 900.0, 2100.0), ("history_errors", 900.0, 2700.0),
     ("icons", 900.0, 520.0),
+    // видимий фокус: у tick подаємо Tab-и (сцена `<розділ>_focus`)
+    ("projects_focus", 900.0, 580.0), ("publish_focus", 900.0, 580.0), ("settings_focus", 900.0, 580.0),
+    // великі вікна: перевірка розтягування контенту
+    ("projects", 1280.0, 800.0),
+    ("publish", 1280.0, 800.0),
+    ("publish_done", 1280.0, 800.0),
+    ("settings", 1280.0, 800.0),
+    ("add_dialog", 1280.0, 800.0),
+    ("projects", 1600.0, 1000.0),
+    ("publish", 1600.0, 1000.0),
+    ("publish_done", 1600.0, 1000.0),
+    ("settings", 1600.0, 1000.0),
+    ("add_dialog", 1600.0, 1000.0),
 ];
 
 fn state() -> Option<&'static Mutex<State>> {
@@ -75,7 +88,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
     (app.hist_q, app.hist_fail, app.hist_all) = (String::new(), false, false);
     (app.update, app.upd_applying, app.upd_err, app.pending, app.confirm_close, app.featured) = (None, false, String::new(), 0, false, false);
     match name {
-        "projects" | "projects_tall" => app.tab = Tab::Projects,
+        "projects" | "projects_tall" | "projects_focus" => app.tab = Tab::Projects,
         "projects_confirm" => {
             app.tab = Tab::Projects;
             app.confirm_del = Some(0);
@@ -85,7 +98,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
             app.merge_hidden = false;
             app.merge_ask = vec![(0, super::Project { name: "Aurora Lights".into(), curse_id: "999".into(), ..Default::default() })];
         }
-        "publish" | "publish_tall" | "publish_done" | "publish_busy" | "close_dialog" | "rollback_dialog" | "history_big" | "history_empty" | "history_errors" => {
+        "publish" | "publish_focus" | "publish_tall" | "publish_done" | "publish_busy" | "close_dialog" | "rollback_dialog" | "history_big" | "history_empty" | "history_errors" => {
             app.cfg.modrinth_token = "fixture".into();
             app.cfg.curse_token = "fixture".into();
             app.tab = Tab::Publish;
@@ -143,7 +156,7 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
                 app.history.clear();
             }
         }
-        "settings" | "settings_tall" | "settings_update" | "settings_updating" | "settings_updateerr" => {
+        "settings" | "settings_focus" | "settings_tall" | "settings_update" | "settings_updating" | "settings_updateerr" => {
             app.cfg.modrinth_token = "fixture".into();
             app.tab = Tab::Settings;
             if name.starts_with("settings_upd") {
@@ -197,12 +210,16 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
     if st.frame == 0 {
         let dir = st.dir.clone();
         scene_setup(app, scene, &dir, &mut st.saved_projects);
+        ctx.memory_mut(|m| if let Some(id) = m.focused() { m.surrender_focus(id) }); // фокус із попередньої сцени не тягнемо
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
     }
     if scene == "icons" {
         icon_sheet(ctx);
     }
     st.frame += 1;
+    if scene.ends_with("_focus") && [6, 10, 14].contains(&st.frame) {
+        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::Next));
+    }
     if st.frame == 30 {
         let slot = st.slot.clone();
         ctx.request_screenshot(move |img| {
