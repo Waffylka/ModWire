@@ -41,8 +41,34 @@ pub struct Last {
     pub mc_versions: String,
     pub loaders: Vec<String>,
     pub release_type: String,
+    /// Незавершена форма публікації (відновлюється після перезапуску).
+    #[serde(skip_serializing_if = "Draft::is_empty")]
+    pub draft: Draft,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
+}
+
+/// Чернетка форми «Публікація»: прив'язана до id проєкту.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct Draft {
+    pub project: String,
+    pub number: String,
+    pub name: String,
+    pub changelog: String,
+    pub file: String,
+}
+
+impl Draft {
+    pub fn is_empty(&self) -> bool {
+        *self == Draft::default()
+    }
+
+    /// Чернетка діє лише для того самого проєкту і якщо номер ще не опубліковано (інакше це залишок минулого релізу).
+    pub fn applies_to(&self, p: &Project) -> bool {
+        !p.id.is_empty() && self.project == p.id && !(self.number.trim().is_empty() && self.changelog.trim().is_empty() && self.name.trim().is_empty() && self.file.is_empty())
+            && !(self.number.trim() == p.last_number.trim() && !p.last_number.trim().is_empty())
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -426,6 +452,20 @@ pub struct Release {
     pub changelog: String,
 }
 
+/// Тип релізу за позначкою в номері: alpha/snapshot/dev → alpha, beta/rc/pre → beta; без позначки None.
+pub fn detect_release_type(number: &str) -> Option<&'static str> {
+    let low = number.to_lowercase();
+    let mut found = None;
+    for t in low.split(|c: char| !c.is_ascii_alphanumeric()).skip(1) {
+        match t.trim_end_matches(|c: char| c.is_ascii_digit()) {
+            "alpha" | "snapshot" | "dev" | "nightly" => return Some("alpha"),
+            "beta" | "rc" | "pre" | "preview" => found = Some("beta"),
+            _ => {}
+        }
+    }
+    found
+}
+
 /// Наступний номер версії: збільшує останнє число ("1.0.9" -> "1.0.10"). Без цифр повертає "".
 pub fn bump(n: &str) -> String {
     match n.split_once('+') {
@@ -667,7 +707,7 @@ pub fn first_section(t: &str) -> String {
 
 pub fn parse_mc(s: &str) -> Vec<String> {
     let mut out: Vec<String> = vec![];
-    for v in s.split(|c: char| c == ',' || c.is_whitespace()).filter(|v| !v.is_empty()) {
+    for v in s.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|v| !v.is_empty()) {
         if !out.iter().any(|o| o == v) {
             out.push(v.to_string());
         }
@@ -1050,14 +1090,35 @@ pub fn icon_path(url: &str) -> Option<PathBuf> {
 /// Завантажує іконку в дисковий кеш (якщо ще немає). Помилки ігноруються.
 pub fn cache_icon(url: &str) {
     let Some(p) = icon_path(url) else { return };
-    if url.is_empty() || p.exists() {
+    if !icon_url_ok(url) || p.exists() {
         return;
     }
     let _ = (|| -> Result<(), String> {
-        let bytes = client_get()?.get(url).send().and_then(|r| r.error_for_status()).and_then(|r| r.bytes()).map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
+        use std::io::Read;
+        let r = client_get()?.get(url).send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        r.take(ICON_MAX + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > ICON_MAX {
+            return Err("іконка завелика".into());
+        }
+        std::fs::create_dir_all(p.parent().ok_or("немає теки")?).map_err(|e| e.to_string())?;
         write_atomic(&p, &bytes).map_err(|e| e.to_string())
     })();
+}
+
+const ICON_MAX: u64 = 2 * 1024 * 1024;
+
+/// Іконку тягнемо лише з https: адреса може прийти з чужого файлу імпорту (не опитуємо локальну мережу по http).
+fn icon_url_ok(url: &str) -> bool {
+    url.starts_with("https://") && url.len() < 2048
+}
+
+/// Читає текстовий файл не більше `max` байт (решта відкидається): величезний файл не з'їдає пам'ять.
+pub fn read_text_capped(p: &Path, max: u64) -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(p).and_then(|f| f.take(max).read_to_end(&mut buf)).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn file_part(file: &Path, up: &Up) -> Result<multipart::Part, String> {
@@ -1516,6 +1577,37 @@ mod tests {
         assert!(matches!(st, Load::Restored) || matches!(st, Load::Recovered));
         let _ = c2;
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn release_type_from_number() {
+        assert_eq!(parse_mc("1.20.1;1.20.2, 1.20.1"), vec!["1.20.1", "1.20.2"]);
+        assert_eq!(detect_release_type("1.2.0-beta.1"), Some("beta"));
+        assert_eq!(detect_release_type("1.2.0+RC2"), Some("beta"));
+        assert_eq!(detect_release_type("2.0-alpha3"), Some("alpha"));
+        assert_eq!(detect_release_type("1.0.0-SNAPSHOT"), Some("alpha"));
+        assert_eq!(detect_release_type("1.0.0-beta-dev"), Some("alpha"));
+        assert_eq!(detect_release_type("1.2.0"), None);
+        assert_eq!(detect_release_type("1.20.1-1.2.0"), None);
+        assert_eq!(detect_release_type("preview"), None); // перша частина — не суфікс
+    }
+
+    #[test]
+    fn draft_rules_and_roundtrip() {
+        let p = Project { id: "p1".into(), last_number: "1.0.0".into(), ..Default::default() };
+        let d = Draft { project: "p1".into(), number: "1.0.1".into(), changelog: "fix".into(), ..Default::default() };
+        assert!(d.applies_to(&p));
+        assert!(!Draft { project: "p2".into(), ..d.clone() }.applies_to(&p)); // інший проєкт
+        assert!(!Draft { number: "1.0.0".into(), ..d.clone() }.applies_to(&p)); // уже опубліковано
+        assert!(!Draft { project: "p1".into(), ..Default::default() }.applies_to(&p)); // порожня
+        // старий конфіг без draft читається, нова чернетка переживає запис/читання
+        let old: Config = serde_json::from_str(r#"{"last":{"dir":"x"}}"#).unwrap();
+        assert_eq!(old.last.draft, Draft::default());
+        let path = tmp_dir("draft").join("config.json");
+        let mut cfg = Config::default();
+        cfg.last.draft = d.clone();
+        save_to(&path, &cfg).unwrap();
+        assert_eq!(load_from(&path).0.last.draft, d);
     }
 
     #[test]
@@ -2324,5 +2416,20 @@ mod tests {
         p.extra.insert("future".into(), json!({"api_token": "x", "ok": 1, "deep": [{"secret": "y", "name": "n"}]}));
         let s = serde_json::to_string(&strip_secrets(&p)).unwrap();
         assert!(!s.contains("api_token") && !s.contains("secret") && s.contains("\"ok\":1") && s.contains("\"name\":\"n\""), "{s}");
+    }
+
+    #[test]
+    fn icons_https_only_and_text_read_is_capped() {
+        assert!(icon_url_ok("https://cdn.modrinth.com/a.png"));
+        for bad in ["http://192.168.0.1/a.png", "file:///C:/x.png", "ftp://x/a.png", "", &format!("https://x/{}", "a".repeat(3000))] {
+            assert!(!icon_url_ok(bad), "{bad}");
+        }
+        let d = tmp_dir("capped");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("big.txt");
+        std::fs::write(&f, "a".repeat(5000)).unwrap();
+        assert_eq!(read_text_capped(&f, 100).unwrap().len(), 100);
+        assert_eq!(read_text_capped(&f, 10_000).unwrap().len(), 5000);
+        assert!(read_text_capped(&d.join("nope.txt"), 10).is_err());
     }
 }

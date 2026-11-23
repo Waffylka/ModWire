@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, "local-*"]
   pull_request:
 
 jobs:
@@ -16,5 +16,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add clippy
-      - run: cargo clippy --all-targets
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets
+      - run: cargo test --locked
