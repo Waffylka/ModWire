@@ -401,12 +401,13 @@ fn card_hover<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 fn card_r<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
-    let r = egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(SURFACE)
         .stroke(Stroke::new(1.0, BORDER))
         .corner_radius(egui::CornerRadius::same(CARD_R))
-        .inner_margin(egui::Margin::same(CARD_PAD))
-        .show(ui, f);
+        .inner_margin(egui::Margin::same(CARD_PAD));
+    // vertical: у ui.columns розкладка «justified» розтягувала пробіли в тексті, що переноситься
+    let r = frame.show(ui, |ui| ui.vertical(f).inner);
     // глибина без тіні: ледь помітний світлий кант угорі, як у підсвіченого краю
     let rc = r.response.rect;
     let y = rc.top() + 1.0;
@@ -710,7 +711,7 @@ fn empty_state(ui: &mut egui::Ui, ic: Ic, name: &str, text: &str) {
 /// Поле токена з іконкою-оком усередині тієї самої рамки.
 fn token_field(ui: &mut egui::Ui, value: &mut String, show: &mut bool) -> bool {
     let mut changed = false;
-    let mut prep = egui::Frame::new().fill(FIELD).corner_radius(egui::CornerRadius::same(R_CTRL)).inner_margin(egui::Margin::symmetric(8, 0)).begin(ui);
+    let mut prep = egui::Frame::new().fill(FIELD).stroke(Stroke::new(1.0, UI_BORDER)).corner_radius(egui::CornerRadius::same(R_CTRL)).inner_margin(egui::Margin::symmetric(8, 0)).begin(ui);
     let mut focused = false;
     {
         let ui = &mut prep.content_ui;
@@ -739,8 +740,12 @@ fn token_field(ui: &mut egui::Ui, value: &mut String, show: &mut bool) -> bool {
             }
         });
     }
-    prep.frame.stroke = if focused { Stroke::new(2.0, ACCENT) } else { Stroke::new(1.0, UI_BORDER) };
-    prep.end(ui);
+    // товщина рамки задана до begin(): інакше end() збільшує зайняту область на 1 px і зсуває картку ліворуч
+    prep.frame.stroke = Stroke::new(1.0, if focused { ACCENT } else { UI_BORDER });
+    let resp = prep.end(ui);
+    if focused {
+        ui.painter().rect_stroke(resp.rect, R_CTRL, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+    }
     changed
 }
 
@@ -1808,7 +1813,7 @@ impl App {
                 hint(ui, "У шаблонах: {version} {mc} {loaders} {date} {project}");
                 ui.horizontal_wrapped(|ui| {
                 if let Some(c) = self.sel.and_then(|i| self.cfg.projects.get(i)).map(|p| p.last_changelog.clone()).filter(|c| !c.is_empty())
-                    && ghost_btn(ui, Some(Ic::File), "З минулої версії").on_hover_text("Взяти changelog минулої версії").clicked()
+                    && ghost_btn(ui, Some(Ic::File), "З минулої версії").on_hover_text("Взяти текст змін минулої версії").clicked()
                 {
                     self.changelog = c;
                 }

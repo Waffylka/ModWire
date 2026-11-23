@@ -84,6 +84,21 @@ The app checks [Releases](https://github.com/Waffylka/ModWire/releases) on start
 
 Updates are accepted only from `https://github.com/Waffylka/ModWire/releases/download/…`, and the downloaded file is checked for size, SHA-256 and the Windows executable signature. If the release asset carries a SHA-256 digest, the download must match it, otherwise the update is cancelled; the update also needs write access to the folder with `modwire.exe` (it will not work from a protected folder such as Program Files). If the new copy exits with an error within a few seconds, the previous version is put back automatically. There are no code signatures: trust rests on HTTPS and access to this repository. The repository address is the `UPDATE_REPO` constant in `src/logic.rs`.
 
+## Environment variables
+
+- `MODWIRE_CONFIG_DIR` - keep the config, history, icon cache and lock file in another folder instead of `<config_dir>/mod-publisher`.
+- `MODWIRE_SHOT_DIR` - developer screenshot mode: saves PNGs of the main screens to this folder. It only starts when `MODWIRE_CONFIG_DIR` is set too, so your real data is never touched.
+- `MODWIRE_SHOT_SCALE` - UI scale for screenshot mode (for example `1.0`); `MODWIRE_SHOT_ONLY` limits it to scenes with that name.
+
+## Known limitations
+
+- The interface is in Ukrainian only.
+- Auto-update replaces the file on Windows only; on macOS the button opens the release page. The build is not code-signed.
+- Auto-update verifies SHA-256 only when the release asset reports one.
+- A publish interrupted mid-upload may still have reached the site: check the version list before retrying (the app warns about this).
+- CurseForge does not accept `.mrpack`; duplicate detection on CurseForge needs the optional Core API key and looks at the latest 500 files.
+- Tokens are stored as plain text in the config file.
+
 ## Font
 
 Bundled Inter font (SIL Open Font License 1.1, https://github.com/rsms/inter).
