@@ -1001,6 +1001,25 @@ fn error_headline(name: &str, e: &str) -> (String, bool, bool) {
     (i18n::fmt(i18n::tr("{}: помилка. {}{}"), &[&name, &short, &if long { "…" } else { "" }]), false, long)
 }
 
+/// Підпис лоадера в чипі: для паків зрозуміла назва замість службового «minecraft».
+fn loader_label(l: &str) -> &str {
+    match l {
+        "minecraft" => i18n::tr("Ресурспак"),
+        "datapack" => i18n::tr("Датапак"),
+        _ => l,
+    }
+}
+
+/// Лоадери для людини: «Ресурспак» замість службового «minecraft» (у чипах, зведенні й примітці про файл).
+fn loaders_text(loaders: &[String]) -> String {
+    loaders.iter().map(|l| loader_label(l)).collect::<Vec<_>>().join(", ")
+}
+
+/// Вибрано і лоадер мода, і ресурспак/датапак водночас.
+fn mixed_pack_loaders(loaders: &[String]) -> bool {
+    loaders.iter().any(|l| is_pack_loader(l)) && loaders.iter().any(|l| !is_pack_loader(l))
+}
+
 /// Рамка модального вікна.
 fn modal_frame() -> egui::Frame {
     egui::Frame::new().fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(egui::CornerRadius::same(CARD_R)).inner_margin(egui::Margin::same(24))
@@ -1344,7 +1363,7 @@ impl App {
                 got.push(i18n::fmt(i18n::tr("тип релізу {}"), &[&(t)]));
             }
             if !i.mc_versions.is_empty() { got.push(format!("Minecraft {}", self.cfg.last.mc_versions)); }
-            if !i.loaders.is_empty() { got.push(i18n::fmt(i18n::tr("лоадери: {}"), &[&(self.cfg.last.loaders.join(", "))])); }
+            if !i.loaders.is_empty() { got.push(i18n::fmt(i18n::tr("лоадери: {}"), &[&(loaders_text(&self.cfg.last.loaders))])); }
             if !got.is_empty() {
                 self.file_note = i18n::fmt(i18n::tr("З файлу підставлено: {}. Перевірте кроки «Версія» і «Сумісність»."), &[&(got.join("; "))]);
             }
@@ -2526,7 +2545,7 @@ impl App {
             proj.map_or_else(String::new, |p| p.name.clone()),
             self.file.as_ref().and_then(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             format!("{} · {}", self.number.trim(), RELEASE_TYPES[self.release_type]),
-            format!("Minecraft {} · {}", self.cfg.last.mc_versions.trim(), self.cfg.last.loaders.join(", ")),
+            format!("Minecraft {} · {}", self.cfg.last.mc_versions.trim(), loaders_text(&self.cfg.last.loaders)),
             self.changelog.lines().find(|l| !l.trim().is_empty()).map(|l| l.chars().take(80).collect()).unwrap_or_default(),
             plats.join(" і "),
         ]
@@ -2576,11 +2595,15 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             for l in LOADERS {
                 let on = self.cfg.last.loaders.iter().any(|x| x == l);
-                if choice(ui, on, l).clicked() {
+                if choice(ui, on, loader_label(l)).clicked() {
                     if on { self.cfg.last.loaders.retain(|x| x != l) } else { self.cfg.last.loaders.push(l.into()) }
                 }
             }
         });
+        // ресурспак/датапак не поєднується з лоадерами модів: Modrinth відхилив би таку версію
+        if mixed_pack_loaders(&self.cfg.last.loaders) {
+            ui.label(RichText::new(i18n::tr("Ресурспак чи датапак не поєднується з лоадерами модів: лишіть один тип.")).color(WARN).size(HINT_SZ));
+        }
         if let Some(i) = &self.file_info {
             for w in compat_warnings(i, &parse_mc(&self.cfg.last.mc_versions), &self.cfg.last.loaders) {
                 ui.label(RichText::new(w).color(WARN).size(HINT_SZ));
@@ -2659,7 +2682,7 @@ impl App {
             (i18n::tr("Файл"), dash(self.file.as_ref().and_then(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
             (i18n::tr("Версія"), dash(if self.number.trim().is_empty() { String::new() } else { format!("{} · {}", self.number.trim(), RELEASE_TYPES[self.release_type]) })),
             ("Minecraft", dash(self.cfg.last.mc_versions.trim().to_string())),
-            (i18n::tr("Лоадери"), dash(self.cfg.last.loaders.join(", "))),
+            (i18n::tr("Лоадери"), dash(loaders_text(&self.cfg.last.loaders))),
         ];
         card(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -3487,6 +3510,9 @@ impl App {
         }
         if let Some(i) = &self.file_info {
             w.extend(compat_warnings(i, &parse_mc(&self.cfg.last.mc_versions), &self.cfg.last.loaders).into_iter().map(|s| s.to_string()));
+        }
+        if mixed_pack_loaders(&self.cfg.last.loaders) {
+            w.push(i18n::tr("Ресурспак чи датапак не поєднується з лоадерами модів: лишіть один тип.").to_string());
         }
         w
     }

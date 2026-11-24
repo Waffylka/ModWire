@@ -7,7 +7,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const LOADERS: [&str; 4] = ["fabric", "forge", "neoforge", "quilt"];
+/// Лоадери модів, потім «лоадери» паків: на Modrinth версія ресурспаку має лоадер `minecraft`, датапаку `datapack`.
+pub const LOADERS: [&str; 6] = ["fabric", "forge", "neoforge", "quilt", "minecraft", "datapack"];
+
+/// Чи це «лоадер» ресурспаку/датапаку: CurseForge для таких версій модлоадера не має.
+pub fn is_pack_loader(l: &str) -> bool {
+    matches!(l, "minecraft" | "datapack")
+}
 pub const RELEASE_TYPES: [&str; 3] = ["release", "beta", "alpha"];
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
@@ -788,6 +794,8 @@ pub struct JarInfo {
     pub deps: Vec<String>,
 }
 
+/// Скільки записів архіву переглядаємо, щоб відрізнити ресурспак від датапаку (великі паки мають тисячі файлів).
+const MAX_PACK_SCAN: usize = 20_000;
 const MAX_DEPS_SEEN: usize = 64;
 /// Скільки залежностей зіставляємо з Modrinth за одну публікацію (кожна = мережевий запит).
 const MAX_DEPS_SEND: usize = 20;
@@ -981,6 +989,18 @@ pub fn read_jar(path: &Path) -> Option<JarInfo> {
             }
         }
     }
+    // ресурспак/датапак: є pack.mcmeta, а метаданих мода немає. assets/ = ресурспак (лоадер minecraft), data/ = датапак
+    // Ресурспаки завжди .zip: .jar або mcmod.info (Forge 1.12 і старші, теж з pack.mcmeta й assets/) означає мод, а не пак.
+    // pack.mcmeta шукаємо за іменем (не залежить від ліміту й порядку записів), у списку імен лише префікс assets/ чи data/.
+    let is_jar = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("jar"));
+    if info.loaders.is_empty() && !is_jar && z.index_for_name("mcmod.info").is_none() && z.index_for_name("pack.mcmeta").is_some() {
+        let names: Vec<String> = z.file_names().take(MAX_PACK_SCAN).flatten().map(|n| n.into_owned()).collect();
+        if names.iter().any(|n| n.starts_with("assets/")) {
+            info.loaders.push("minecraft");
+        } else if names.iter().any(|n| n.starts_with("data/")) {
+            info.loaders.push("datapack");
+        }
+    }
     if info.version.is_none() {
         info.version = jar_entry(&mut z, "META-INF/MANIFEST.MF").and_then(|t| manifest_version(&t));
     }
@@ -1156,7 +1176,8 @@ pub fn resolve_curse_ids(types: &Value, versions: &Value, mc: &[String], loaders
             None => missing.push(format!("версію MC {m}")),
         }
     }
-    for l in loaders {
+    // ресурспаки й датапаки на CurseForge мають лише версії Minecraft, без модлоадера
+    for l in loaders.iter().filter(|l| !is_pack_loader(l)) {
         match find(&|t| Some(t) == loader_type, l) {
             Some(id) => ids.push(id),
             None => missing.push(format!("лоадер {l}")),
@@ -3092,6 +3113,51 @@ mod tests {
 
         assert!(mc_exact(">=1.20").is_none() && mc_exact("1.20.x").is_none() && mc_exact("~1.20.1").is_none());
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn resource_and_data_packs_get_their_own_loader() {
+        let d = tmp_dir("packs");
+        let (res, data, nothing, modjar) = (d.join("res.zip"), d.join("data.zip"), d.join("plain.zip"), d.join("mod.zip"));
+        zip_with(&res, &[("pack.mcmeta", "{}"), ("assets/minecraft/lang/en_us.json", "{}")]);
+        zip_with(&data, &[("pack.mcmeta", "{}"), ("data/x/recipes/a.json", "{}")]);
+        zip_with(&nothing, &[("readme.txt", "x")]);
+        // Forge 1.12: mcmod.info замість mods.toml, але pack.mcmeta й assets/ теж є. Це мод (.jar), а не ресурспак
+        let (old_forge, old_forge_zip) = (d.join("old.jar"), d.join("old.zip"));
+        zip_with(&old_forge, &[("mcmod.info", "[]"), ("pack.mcmeta", "{}"), ("assets/m/a.png", "")]);
+        zip_with(&old_forge_zip, &[("mcmod.info", "[]"), ("pack.mcmeta", "{}"), ("assets/m/a.png", "")]);
+        assert!(read_jar(&old_forge).unwrap().loaders.is_empty() && read_jar(&old_forge_zip).unwrap().loaders.is_empty(), "лоадери мода не підміняються на minecraft");
+        // pack.mcmeta після тисяч assets/: знаходиться за іменем, а не за порядком у каталозі
+        let big = d.join("big.zip");
+        {
+            use std::io::Write;
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&big).unwrap());
+            for i in 0..2_000 {
+                w.start_file(format!("assets/minecraft/textures/t{i}.png"), zip::write::SimpleFileOptions::default()).unwrap();
+            }
+            w.start_file("pack.mcmeta", zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(b"{}").unwrap();
+            w.finish().unwrap();
+        }
+        assert_eq!(read_jar(&big).unwrap().loaders, vec!["minecraft"]);
+        // мод із pack.mcmeta (так буває) лишається модом: лоадер береться з його метаданих
+        zip_with(&modjar, &[("pack.mcmeta", "{}"), ("assets/m/a.png", ""), ("fabric.mod.json", r#"{"version":"1"}"#)]);
+        assert_eq!(read_jar(&res).unwrap().loaders, vec!["minecraft"]);
+        assert_eq!(read_jar(&data).unwrap().loaders, vec!["datapack"]);
+        assert!(read_jar(&nothing).unwrap().loaders.is_empty());
+        assert_eq!(read_jar(&modjar).unwrap().loaders, vec!["fabric"]);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn curseforge_ignores_pack_loaders_but_still_needs_mod_loaders() {
+        let types = json!([{"id":1,"name":"Minecraft 1.20"},{"id":68441,"name":"Modloader"}]);
+        let versions = json!([{"id":10,"gameVersionTypeID":1,"name":"1.20.1"},{"id":20,"gameVersionTypeID":68441,"name":"Fabric"}]);
+        let mc = vec!["1.20.1".to_string()];
+        assert_eq!(resolve_curse_ids(&types, &versions, &mc, &["minecraft".to_string()]).unwrap(), vec![10], "ресурспак: лише версія MC");
+        assert_eq!(resolve_curse_ids(&types, &versions, &mc, &["fabric".to_string()]).unwrap(), vec![10, 20]);
+        assert!(resolve_curse_ids(&types, &versions, &mc, &["forge".to_string()]).is_err(), "невідомий модлоадер лишається помилкою");
+        assert!(LOADERS.contains(&"minecraft") && is_pack_loader("datapack") && !is_pack_loader("fabric"));
     }
 
     #[test]
