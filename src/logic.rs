@@ -126,7 +126,7 @@ pub fn update_visible(version: &str, skipped: &str, manual: bool) -> bool {
 /// М'яке попередження перед публікацією: токен вибраної платформи ще жодного разу не перевіряли (0 = не перевірявся).
 pub fn unchecked_tokens(mr: bool, cf: bool, mr_checked: u64, cf_checked: u64) -> Option<String> {
     let names: Vec<&str> = [(mr && mr_checked == 0, "Modrinth"), (cf && cf_checked == 0, "CurseForge")].into_iter().filter(|x| x.0).map(|x| x.1).collect();
-    (!names.is_empty()).then(|| format!("Токен {} не перевірено: «Налаштування» → «Перевірити» (так права видно до публікації).", names.join(" і ")))
+    (!names.is_empty()).then(|| format!("Токен {} не перевірено: «Налаштування» → «Перевірити».", names.join(" і ")))
 }
 
 /// Прибирає секрети з тексту помилки (сервер може повернути у тілі те, що ми надіслали в заголовку).

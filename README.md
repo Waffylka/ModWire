@@ -29,7 +29,7 @@ A native desktop app written in Rust ([egui](https://github.com/emilk/egui)). Pi
 - **Publish history** with search, a failures-only filter, open / copy link for each published version, and CSV export.
 - **Auto-update.** An "update available" banner with an Update button (Windows). The download is verified (size, SHA-256 from the release when available), the folder must be writable, and if the new build crashes right after start the previous version is restored.
 - **Import and export of projects** without tokens, and a safe config save with a backup copy.
-- **Keyboard friendly.** Ctrl/Cmd+Enter publishes (from another section it first opens Publish so you can see the summary), Ctrl/Cmd+1/2/3 switches sections; screen reader labels are provided.
+- **Keyboard friendly.** Ctrl/Cmd+Enter publishes (from another section it first opens Publish so you can see the summary), Ctrl/Cmd+1/2/3/4 switch sections (Projects, Publish, History, Settings); screen reader labels are provided.
 
 ## Install
 

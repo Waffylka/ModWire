@@ -26,7 +26,7 @@ One local tool that publishes to both platforms at the same time, reads metadata
 
 ## Operating Context
 
-Used on release day on a Windows or macOS desktop. Tokens (Modrinth personal access token, CurseForge upload token) are pasted into Settings and stored locally in `<config_dir>/mod-publisher/config.json` as plain text. Sections: Publish, Projects, History. Keyboard-driven: Ctrl/Cmd+Enter publishes, Ctrl/Cmd+1/2/3 switches sections. Built-in auto-update (Windows).
+Used on release day on a Windows or macOS desktop. Tokens (Modrinth personal access token, CurseForge upload token) are pasted into Settings and stored locally in `<config_dir>/mod-publisher/config.json` as plain text. Sections: Publish, Projects, History. Keyboard-driven: Ctrl/Cmd+Enter publishes, Ctrl/Cmd+1/2/3/4 switch sections (Projects, Publish, History, Settings). Built-in auto-update (Windows).
 
 ## Capabilities and Constraints
 

@@ -103,6 +103,9 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
             app.cfg.curse_token = "fixture".into();
             app.tab = Tab::Publish;
             app.select_project(Some(0));
+            // сцени «history_*» мають показувати сам розділ історії, а не крок «Проєкт» (історія порожня лише в history_empty)
+            app.pub_step = if name.starts_with("history") && name != "history_empty" { 6 } else { 0 };
+            if name == "publish_tall" { app.pub_step = 5; }
             if app.file.is_none() {
                 let f = dir.join("aurora-lights-1.2.0.jar");
                 let _ = std::fs::write(&f, b"fixture");
@@ -113,6 +116,8 @@ fn scene_setup(app: &mut App, name: &str, dir: &std::path::Path, saved: &mut Opt
                 app.cfg.last.loaders = vec!["fabric".into(), "forge".into()];
             }
             app.featured = name == "publish_tall";
+            // після set_file (він вмикає зведення): повна форма показує зведення, а майстер (крок «Куди публікувати» з розкритими додатками) знімаємо окремими сценами
+            app.edit_mode = matches!(name, "publish_tall" | "publish_focus");
             if name == "publish_busy" || name == "close_dialog" {
                 use std::sync::atomic::Ordering::Relaxed;
                 app.pending = 2;
@@ -217,7 +222,7 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
         icon_sheet(ctx);
     }
     st.frame += 1;
-    if scene.ends_with("_focus") && [6, 10, 14].contains(&st.frame) {
+    if scene.ends_with("_focus") && [6, 10, 14, 18, 22].contains(&st.frame) {
         ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::Next));
     }
     if st.frame == 30 {
