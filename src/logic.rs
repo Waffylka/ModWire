@@ -251,6 +251,34 @@ pub fn curse_lookup_slug(key: &str, slug: &str) -> Result<(String, String, Strin
     Ok((d["id"].as_u64().ok_or("немає id проєкту")?.to_string(), name, icon))
 }
 
+/// Результат пошуку за назвою на CurseForge.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CfHit {
+    pub id: String,
+    pub name: String,
+    pub icon_url: String,
+}
+
+/// Відповідь /v1/mods/search → список (id, назва, іконка); елементи без id чи назви пропускаються.
+pub fn parse_curse_search(v: &Value) -> Vec<CfHit> {
+    v["data"].as_array().map(|a| {
+        a.iter().filter_map(|d| {
+            let (name, icon_url) = parse_curse_mod(&json!({ "data": d }))?;
+            Some(CfHit { id: d["id"].as_u64()?.to_string(), name, icon_url })
+        }).collect()
+    }).unwrap_or_default()
+}
+
+/// Пошук проєктів Minecraft на CurseForge за назвою через Core API (потрібен ключ).
+pub fn curse_search(key: &str, query: &str) -> Result<Vec<CfHit>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(vec![]);
+    }
+    let url = reqwest::Url::parse_with_params(&format!("{}/v1/mods/search", core()), [("gameId", "432"), ("searchFilter", q), ("pageSize", "10")]).map_err(|e| e.to_string())?;
+    Ok(parse_curse_search(&get_json(&client_t(20)?, url.as_str(), ("x-api-key", key))?))
+}
+
 /// Для export: прибирає зайві поля, схожі на секрети.
 fn strip_secrets(p: &Project) -> Project {
     fn secret(k: &str) -> bool {
@@ -1189,6 +1217,7 @@ pub fn resolve_curse_ids(types: &Value, versions: &Value, mc: &[String], loaders
 pub struct MrProject {
     pub id: String,
     pub title: String,
+    pub slug: String,
     pub icon_url: String,
 }
 
@@ -1203,6 +1232,7 @@ pub fn parse_projects(v: &Value) -> Vec<MrProject> {
                 Some(MrProject {
                     id: p["id"].as_str()?.into(),
                     title: p["title"].as_str()?.into(),
+                    slug: p["slug"].as_str().unwrap_or("").into(),
                     icon_url: p["icon_url"].as_str().unwrap_or("").into(),
                 })
             })
@@ -2079,6 +2109,22 @@ fn install(exe: &Path, new: &Path, old: &Path, sha256: &str) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn curse_search_parsing() {
+        let v = json!({"data": [
+            {"id": 11, "name": "Alpha", "logo": {"thumbnailUrl": "https://x/a.png"}},
+            {"id": 22, "name": "Beta"},
+            {"name": "NoId"},
+            {"id": 33}
+        ]});
+        let h = parse_curse_search(&v);
+        assert_eq!(h.len(), 2, "{h:?}");
+        assert_eq!((h[0].id.as_str(), h[0].name.as_str(), h[0].icon_url.as_str()), ("11", "Alpha", "https://x/a.png"));
+        assert_eq!((h[1].id.as_str(), h[1].icon_url.as_str()), ("22", ""));
+        assert!(parse_curse_search(&json!({})).is_empty());
+        assert_eq!(curse_search("k", "  ").unwrap(), vec![]);
+    }
+
     use super::*;
 
     fn rel() -> Release {

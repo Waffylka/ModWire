@@ -81,6 +81,7 @@ enum Msg {
     CheckProj(Result<String, String>), // перевірка проєкту CurseForge через Core API
     CfInfo(String, Option<usize>, Result<(String, String), String>),
     Found(Option<usize>, Result<Box<Project>, String>), // проєкт знайдено за посиланням/slug
+    CfSearch(Result<Vec<CfHit>, String>), // пошук CurseForge за назвою
     Done(P, Result<String, String>),
     File(PathBuf, Option<JarInfo>), // jar читається у фоновому потоці: великий файл/мережевий диск не гальмує кадр
     ExtraFile(PathBuf), // додатковий файл версії (Modrinth)
@@ -117,6 +118,10 @@ struct App {
     merge_ask: Vec<(usize, Project)>, // черга питань про однакову назву
     centered: bool,                  // вікно вже центровано після першого кадру
     add_msg: String,
+    add_tab: u8,              // вкладка вікна «Додати проєкт»: 0 Modrinth, 1 CurseForge
+    cf_query: String,         // пошук CurseForge за назвою
+    cf_hits: Vec<CfHit>,
+    cf_loading: bool,
     // публікація
     sel: Option<usize>,
     file: Option<PathBuf>,
@@ -579,6 +584,68 @@ struct StepSpec<'a> {
     summary: &'a str,
     scroll: bool, // прокрутити до цього кроку й розгорнути
     tabbed: bool, // крок показано як окрему вкладку: без згортання й з'єднувача
+}
+
+/// Вкладка платформи у вікні додавання: крапка кольору платформи й назва; вибрана — світліша плитка в рамці.
+fn add_tab_btn(ui: &mut egui::Ui, on: bool, name: &str, col: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, name.to_string()));
+    let p = ui.painter();
+    if on {
+        p.rect_filled(rect, 9, Color32::from_rgb(0x26, 0x27, 0x2d));
+        p.rect_stroke(rect, 9, Stroke::new(1.0, Color32::from_rgb(0x3a, 0x3c, 0x4a)), egui::StrokeKind::Inside);
+    } else if resp.hovered() {
+        p.rect_filled(rect, 9, HOVER.gamma_multiply(0.6));
+    }
+    if resp.has_focus() {
+        p.rect_stroke(rect, 9, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+    }
+    let g = p.layout_no_wrap(name.to_owned(), egui::FontId::proportional(14.0), if on { TEXT } else { MUTED });
+    let x0 = rect.center().x - (g.size().x + 16.0) / 2.0;
+    p.circle_filled(egui::pos2(x0 + 4.0, rect.center().y), 4.0, col);
+    p.galley(egui::pos2(x0 + 16.0, rect.center().y - g.size().y / 2.0), g, if on { TEXT } else { MUTED });
+    resp
+}
+
+/// Значок 22 px у рядку (банер у вікні додавання).
+fn draw_icon_inline(ui: &mut egui::Ui, ic: Ic, col: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+    draw_icon(ui.painter(), rect.center(), ic, 22.0, col);
+}
+
+/// Зелена кнопка вікна додавання (як на макеті): висота 44, закруглення 10.
+fn add_green(text: &str) -> Solid {
+    Solid { text: text.to_owned(), fill: Color32::from_rgb(0x1b, 0xd9, 0x6a), fg: Color32::from_rgb(0x08, 0x16, 0x0e), min: egui::vec2(0.0, 44.0) }
+}
+
+/// Розділювач із підписом посередині: «── Ваші проєкти на Modrinth ──».
+fn labeled_divider(ui: &mut egui::Ui, text: &str) {
+    let g = ui.painter().layout_no_wrap(text.to_owned(), egui::FontId::proportional(HINT_SZ), MUTED);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+    let p = ui.painter();
+    let (cx, cy) = (rect.center().x, rect.center().y);
+    let half = g.size().x / 2.0 + 12.0;
+    p.hline(rect.left()..=(cx - half).max(rect.left()), cy, Stroke::new(1.0, BORDER));
+    p.hline((cx + half).min(rect.right())..=rect.right(), cy, Stroke::new(1.0, BORDER));
+    p.galley(egui::pos2(cx - g.size().x / 2.0, cy - g.size().y / 2.0), g, MUTED);
+}
+
+/// Рядок проєкту у списку: іконка 40, назва, підпис, праворуч дія.
+fn add_row(ui: &mut egui::Ui, icon_url: &str, name: &str, sub: &str, right: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new().fill(Color32::from_rgb(0x26, 0x27, 0x2d)).stroke(Stroke::new(1.0, BORDER)).corner_radius(12).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            icon(ui, icon_url, name, 40.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add(egui::Label::new(RichText::new(name).color(TEXT).size(14.5)).truncate());
+                if !sub.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(sub).color(MUTED).size(12.5)).truncate());
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+        });
+    });
 }
 
 /// Група версії для списку: «1.20» для 1.20.4, «Знімки» для всього, що не схоже на реліз.
@@ -1298,7 +1365,7 @@ impl App {
         let mut app = Self {
             tab: if cfg.projects.is_empty() { Tab::Projects } else { Tab::Publish }, // у день релізу відразу робочий екран; без проєктів спершу додати
             edit_mode: true, review_now: false, tx, rx, add_open: false, target: None, mr_list: vec![], mr_loading: false, mr_msg: String::new(),
-            cf_id: String::new(), cur_name: String::new(), proj_chk: Chk::Idle, featured: false, send_deps: false, extra_files: vec![], mr_link: String::new(), sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), sel, file: None,
+            cf_id: String::new(), cur_name: String::new(), proj_chk: Chk::Idle, featured: false, send_deps: false, extra_files: vec![], mr_link: String::new(), sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), add_tab: 0, cf_query: String::new(), cf_hits: vec![], cf_loading: false, sel, file: None,
             name: String::new(), number: sel.and_then(|i| cfg.projects.get(i)).map(|p| bump(&p.last_number)).unwrap_or_default(), release_type: rt, changelog: String::new(),
             use_mr: true, use_cf: true, mr_res: None, cf_res: None, pending: 0, msg: String::new(),
             show_tokens: false, confirm_del: None, confirm_clear: false, check_msg: checked_msg(cfg.modrinth_checked), up_mr: Up::default(), up_cf: Up::default(), cur_cl: String::new(), cur_meta: Default::default(),
@@ -1439,7 +1506,7 @@ impl App {
     /// Фоновий потік впав: прапорці «зайнято» не мають лишатися назавжди.
     fn on_panic(&mut self) {
         let retry = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
-        (self.mc_loading, self.mr_loading, self.upd_checking, self.upd_applying, self.refreshing, self.adding) = (false, false, false, false, false, 0);
+        (self.mc_loading, self.mr_loading, self.upd_checking, self.upd_applying, self.refreshing, self.adding, self.cf_loading) = (false, false, false, false, false, 0, false);
         self.mc_next = retry;
         for c in [&mut self.check_msg, &mut self.cf_msg, &mut self.key_msg] {
             if matches!(c, Chk::Checking) {
@@ -1463,6 +1530,7 @@ impl App {
             Msg::CheckKey(r) => Msg::CheckKey(f(r)),
             Msg::CheckProj(r) => Msg::CheckProj(f(r)),
             Msg::Found(i, r) => Msg::Found(i, r.map_err(|e| self.mask(e))),
+            Msg::CfSearch(r) => Msg::CfSearch(r.map_err(|e| self.mask(e))),
             Msg::List(r) => Msg::List(r.map_err(|e| self.mask(e))),
             Msg::CfInfo(id, t, r) => Msg::CfInfo(id, t, r.map_err(|e| self.mask(e))),
             Msg::Updated(r) => Msg::Updated(r.map_err(|e| self.mask(e))),
@@ -1533,6 +1601,16 @@ impl App {
                     self.target = target;
                     self.add_project(Project { name, curse_id: id, icon_url: icon, ..Default::default() });
                     self.cf_id.clear();
+                }
+                Msg::CfSearch(r) => {
+                    self.cf_loading = false;
+                    match r {
+                        Ok(h) => {
+                            if h.is_empty() { self.add_msg = i18n::tr("Нічого не знайдено за цією назвою.").into(); }
+                            self.cf_hits = h;
+                        }
+                        Err(e) => self.add_msg = i18n::fmt(i18n::tr("Core API: {}. Пошук не вдався."), &[&(e)]),
+                    }
                 }
                 Msg::Found(target, r) => {
                     self.adding = self.adding.saturating_sub(1);
@@ -2352,38 +2430,53 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_width((ctx.content_rect().width() - 80.0).clamp(480.0, 720.0)); // ширше, але не більше за вікно
                 ui.horizontal(|ui| {
-                    ui.label(title(i18n::tr("btn.add_project")));
+                    ui.label(RichText::new(i18n::tr("btn.add_project")).size(22.0).color(TEXT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if close_x(ui).clicked() { close = true; }
                     });
                 });
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical().id_salt("add_scroll").max_height((ctx.content_rect().height() - 140.0).max(200.0)).auto_shrink([false, true]).show(ui, |ui| {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().id_salt("add_scroll").max_height((ctx.content_rect().height() - 200.0).max(200.0)).auto_shrink([false, true]).show(ui, |ui| {
                 ui.set_width(ui.available_width() - 12.0);
                 hint(ui, i18n::tr("Мод має вже існувати на сайті. Оберіть, де він є, і він з'явиться у списку. Можна додати обидві платформи до одного проєкту."));
-                ui.add_space(8.0);
-                field_label(ui, i18n::tr("Куди додати"));
+                ui.add_space(12.0);
+                // «Куди додати»: підпис ліворуч, список праворуч
                 let label = |i: Option<usize>, ps: &[Project]| match i.and_then(|i| ps.get(i)) {
                     Some(p) => i18n::fmt(i18n::tr("Додати до: {}"), &[&(p.name)]),
                     None => i18n::tr("Новий проєкт").to_string(),
                 };
-                combo_box("target").width(ui.available_width()).selected_text(label(self.target, &self.cfg.projects)).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.target, None, i18n::tr("Новий проєкт"));
-                    for (i, p) in self.cfg.projects.iter().enumerate() {
-                        ui.selectable_value(&mut self.target, Some(i), i18n::fmt(i18n::tr("Додати до: {}"), &[&(p.name)]));
-                    }
-                });
-
-                // --- Modrinth ---
-                ui.add_space(8.0);
-                card(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(title("Modrinth").color(MR_GREEN));
+                ui.horizontal(|ui| {
+                    let (lrect, _) = ui.allocate_exact_size(egui::vec2(110.0, 36.0), egui::Sense::hover());
+                    ui.painter().text(lrect.left_center(), egui::Align2::LEFT_CENTER, i18n::tr("Куди додати"), egui::FontId::proportional(13.0), TEXT);
+                    combo_box("target").width(ui.available_width()).selected_text(label(self.target, &self.cfg.projects)).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.target, None, i18n::tr("Новий проєкт"));
+                        for (i, p) in self.cfg.projects.iter().enumerate() {
+                            ui.selectable_value(&mut self.target, Some(i), i18n::fmt(i18n::tr("Додати до: {}"), &[&(p.name)]));
+                        }
                     });
+                });
+                // --- вкладки платформ ---
+                ui.add_space(12.0);
+                egui::Frame::new().fill(Color32::from_rgb(0x17, 0x18, 0x1b)).stroke(Stroke::new(1.0, BORDER)).corner_radius(12).inner_margin(5).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.columns(2, |cols| {
+                        if add_tab_btn(&mut cols[0], self.add_tab == 0, "Modrinth", MR_GREEN).clicked() { self.add_tab = 0; }
+                        if add_tab_btn(&mut cols[1], self.add_tab == 1, "CurseForge", CF_ORANGE).clicked() { self.add_tab = 1; }
+                    });
+                });
+                ui.add_space(12.0);
+                if self.add_tab == 0 {
+                    // --- Modrinth ---
                     let lid = field_label(ui, i18n::tr("Посилання або ідентифікатор (slug)"));
-                    let lr = ui.add(egui::TextEdit::singleline(&mut self.mr_link).hint_text("modrinth.com/mod/назва").desired_width(f32::INFINITY)).labelled_by(lid);
                     let slug = modrinth_slug_input(&self.mr_link);
+                    let mut go = false;
+                    let mut lr = None;
+                    ui.horizontal(|ui| {
+                        let w = (ui.available_width() - 110.0).max(160.0);
+                        lr = Some(ui.add(egui::TextEdit::singleline(&mut self.mr_link).hint_text("modrinth.com/mod/назва").desired_width(w).min_size(egui::vec2(w, 44.0)).align(egui::Align2::LEFT_CENTER)).labelled_by(lid));
+                        go = ui.add_enabled(slug.is_some(), add_green(i18n::tr("btn.add"))).clicked();
+                    });
+                    let lr = lr.expect("поле створено в рядку вище");
                     if !self.mr_link.trim().is_empty() && slug.is_none() {
                         field_error(ui, &lr, i18n::tr("Вставте посилання modrinth.com/mod/… або ідентифікатор (slug)"));
                     }
@@ -2394,7 +2487,7 @@ impl App {
                         hint(ui, "Вставте адресу сторінки мода й натисніть Enter, або оберіть зі списку нижче.");
                     }
                     let enter = lr.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if let Some(slug) = slug && (ui.add_enabled_ui(true, |ui| ghost_btn(ui, Some(Ic::Plus), i18n::tr("Додати за посиланням"))).inner.clicked() || enter) {
+                    if let Some(slug) = slug && (go || enter) {
                         let (t, target) = (self.cfg.modrinth_token.trim().to_string(), self.target);
                         self.adding += 1; // Found зменшує лічильник
                         self.spawn(ctx, move || {
@@ -2407,53 +2500,70 @@ impl App {
                         self.mr_link.clear();
                         self.add_open = false;
                     }
-                    ui.add_space(4.0);
-                    let clicked = ui.add_enabled_ui(!self.mr_loading, |ui| ghost_btn(ui, Some(Ic::Upload), if self.mr_list.is_empty() { i18n::tr("Завантажити мої проєкти") } else { i18n::tr("Оновити список") })).inner.clicked();
-                    // список підтягується сам при відкритті, якщо є токен
-                    if clicked || (just_opened && !self.mr_loading && self.mr_list.is_empty() && !self.cfg.modrinth_token.trim().is_empty()) {
-                        if self.cfg.modrinth_token.trim().is_empty() {
-                            self.mr_msg = "Спершу вкажіть токен Modrinth у налаштуваннях".into();
-                        } else {
-                            self.mr_loading = true;
-                            self.mr_msg.clear();
-                            let t = self.cfg.modrinth_token.trim().to_string();
-                            self.spawn(ctx, move || {
-                                let r = modrinth_projects(&t);
-                                if let Ok(l) = &r { l.iter().for_each(|p| cache_icon(&p.icon_url)); }
-                                Msg::List(r)
-                            });
-                        }
+                    ui.add_space(12.0);
+                    labeled_divider(ui, &i18n::fmt(i18n::tr("Ваші проєкти на {}"), &[&"Modrinth"]));
+                    ui.add_space(6.0);
+                    let has_token = !self.cfg.modrinth_token.trim().is_empty();
+                    let mut clicked = false;
+                    if has_token {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            clicked = ui.add_enabled_ui(!self.mr_loading, |ui| ghost_btn(ui, Some(Ic::Refresh), if self.mr_list.is_empty() { i18n::tr("Завантажити мої проєкти") } else { i18n::tr("Оновити список") })).inner.clicked();
+                        });
+                        ui.add_space(6.0);
                     }
-                    if self.cfg.modrinth_token.trim().is_empty() {
-                        hint(ui, "Для списку потрібен токен Modrinth (вкладка «Налаштування»).");
+                    // список підтягується сам при відкритті, якщо є токен
+                    if clicked || (just_opened && !self.mr_loading && self.mr_list.is_empty() && has_token) {
+                        self.mr_loading = true;
+                        self.mr_msg.clear();
+                        let t = self.cfg.modrinth_token.trim().to_string();
+                        self.spawn(ctx, move || {
+                            let r = modrinth_projects(&t);
+                            if let Ok(l) = &r { l.iter().for_each(|p| cache_icon(&p.icon_url)); }
+                            Msg::List(r)
+                        });
+                    }
+                    if !has_token {
+                        // жовтий банер із кнопкою, як на макеті
+                        egui::Frame::new().fill(Color32::from_rgba_unmultiplied(240, 163, 94, 26)).stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(240, 163, 94, 128))).corner_radius(14).inner_margin(egui::Margin::symmetric(18, 14)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                draw_icon_inline(ui, Ic::Warn, WARN);
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new("Потрібен токен Modrinth.").strong().color(TEXT));
+                                    ui.label(RichText::new("Щоб показати список ваших проєктів, вкажіть токен із правами Read user і Read projects.").color(MUTED).size(HINT_SZ));
+                                });
+                            });
+                            ui.add_space(6.0);
+                            if ghost_btn(ui, Some(Ic::Gear), "Відкрити налаштування").clicked() {
+                                (self.tab, self.set_sec) = (Tab::Settings, 0);
+                                self.add_open = false;
+                            }
+                        });
                     }
                     if !self.mr_msg.is_empty() {
                         banner(ui, Kind::Error, &self.mr_msg);
                     }
                     let mut pick = None;
-                    egui::ScrollArea::vertical().id_salt("mr_list").max_height((ctx.content_rect().height() * 0.45).clamp(170.0, 380.0)).auto_shrink([false, true]).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("mr_list").max_height((ctx.content_rect().height() * 0.4).clamp(150.0, 320.0)).auto_shrink([false, true]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 8.0;
                         if self.mr_list.is_empty() {
                             if self.mr_loading {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
                                     hint(ui, i18n::tr("Завантаження…"));
                                 });
-                            } else if !self.cfg.modrinth_token.trim().is_empty() && self.mr_msg.is_empty() {
+                            } else if has_token && self.mr_msg.is_empty() {
                                 hint(ui, "На цьому акаунті Modrinth проєктів не знайдено.");
                             }
                         }
                         for (i, p) in self.mr_list.iter().enumerate() {
                             let added = self.cfg.projects.iter().any(|q| q.modrinth_id == p.id);
-                            ui.horizontal(|ui| {
-                                icon(ui, &p.icon_url, &p.title, 32.0);
-                                ui.add(egui::Label::new(&p.title).truncate());
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if added {
-                                        badge_ic(ui, i18n::tr("Уже додано"), SUCCESS, Some(Ic::Check));
-                                    } else if ghost_btn(ui, Some(Ic::Plus), i18n::tr("btn.add")).clicked() {
-                                        pick = Some(i);
-                                    }
-                                });
+                            add_row(ui, &p.icon_url, &p.title, &p.slug, |ui| {
+                                if added {
+                                    badge_ic(ui, i18n::tr("Уже додано"), SUCCESS, Some(Ic::Check));
+                                } else if ghost_btn(ui, None, i18n::tr("btn.add")).clicked() {
+                                    pick = Some(i);
+                                }
                             });
                         }
                     });
@@ -2463,27 +2573,25 @@ impl App {
                         self.add_project(np);
                         self.add_open = false;
                     }
-                });
-
-                // --- CurseForge ---
-                ui.add_space(8.0);
-                card(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(title("CurseForge").color(CF_COL));
-                    });
+                } else {
+                    // --- CurseForge ---
                     let lid = field_label(ui, i18n::tr("ID або посилання *"));
-                    let idr = ui.add(egui::TextEdit::singleline(&mut self.cf_id).hint_text("123456 або curseforge.com/minecraft/mc-mods/назва").desired_width(f32::INFINITY)).labelled_by(lid);
                     let cf_link = parse_project_link(&self.cf_id);
+                    let id_ok = !self.cf_id.trim().is_empty() && (self.cf_id.trim().chars().all(|c| c.is_ascii_digit()) || matches!(cf_link, Some(Link::CurseId(_) | Link::CurseSlug(_))));
+                    let (mut go, mut idr) = (false, None);
+                    ui.horizontal(|ui| {
+                        let w = (ui.available_width() - 110.0).max(160.0);
+                        idr = Some(ui.add(egui::TextEdit::singleline(&mut self.cf_id).hint_text("123456 або curseforge.com/minecraft/mc-mods/назва").desired_width(w).min_size(egui::vec2(w, 44.0)).align(egui::Align2::LEFT_CENTER)).labelled_by(lid));
+                        go = ui.add_enabled(id_ok, add_green(i18n::tr("btn.add"))).on_disabled_hover_text(i18n::tr("Введіть ID проєкту або посилання curseforge.com")).clicked();
+                    });
+                    let idr = idr.expect("поле створено в рядку вище");
                     if !self.cf_id.trim().is_empty() && !self.cf_id.trim().chars().all(|c| c.is_ascii_digit()) && cf_link.is_none() {
                         field_error(ui, &idr, i18n::tr("Лише цифри або посилання curseforge.com"));
                     }
                     hint(ui, if self.cfg.curse_core_key.trim().is_empty() { i18n::tr("Без Core API-ключа проєкт отримає назву «CurseForge #ID»; ключ додається в налаштуваннях.") } else { i18n::tr("Назву й іконку буде підтягнуто через Core API-ключ.") });
-                    let id_ok = !self.cf_id.trim().is_empty() && (self.cf_id.trim().chars().all(|c| c.is_ascii_digit()) || matches!(cf_link, Some(Link::CurseId(_) | Link::CurseSlug(_))));
-                    let key =self.cfg.curse_core_key.trim().to_string();
-                    let can_add = id_ok;
+                    let key = self.cfg.curse_core_key.trim().to_string();
                     let enter = idr.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.add_enabled(can_add, primary(i18n::tr("Додати з CurseForge")).min_size(egui::vec2(ui.available_width(), CTRL_H))).on_disabled_hover_text(i18n::tr("Введіть ID проєкту або посилання curseforge.com")).clicked() || (can_add && enter) {
+                    if go || (id_ok && enter) {
                         self.cf_id = self.cf_id.trim().to_string();
                         if let Some(Link::CurseId(id)) = parse_project_link(&self.cf_id) {
                             self.cf_id = id;
@@ -2505,25 +2613,86 @@ impl App {
                                 self.add_open = false;
                             }
                         } else {
-                        let (id, target) = (self.cf_id.clone(), self.target);
-                        self.adding += 1; // CfInfo зменшує лічильник
-                        if key.is_empty() {
-                            self.spawn(ctx, move || Msg::CfInfo(id, target, Ok((String::new(), String::new()))));
-                        } else {
-                            self.spawn(ctx, move || {
-                                let r = curse_mod_info(&key, &id);
-                                if let Ok((_, u)) = &r { cache_icon(u); }
-                                Msg::CfInfo(id, target, r)
-                            });
-                        }
-                        self.add_open = false;
+                            let (id, target) = (self.cf_id.clone(), self.target);
+                            self.adding += 1; // CfInfo зменшує лічильник
+                            if key.is_empty() {
+                                self.spawn(ctx, move || Msg::CfInfo(id, target, Ok((String::new(), String::new()))));
+                            } else {
+                                self.spawn(ctx, move || {
+                                    let r = curse_mod_info(&key, &id);
+                                    if let Ok((_, u)) = &r { cache_icon(u); }
+                                    Msg::CfInfo(id, target, r)
+                                });
+                            }
+                            self.add_open = false;
                         }
                     }
-                });
+                    // --- пошук за назвою (Core API-ключ) ---
+                    ui.add_space(12.0);
+                    labeled_divider(ui, i18n::tr("Або знайдіть за назвою"));
+                    ui.add_space(8.0);
+                    let search_key = self.cfg.curse_core_key.trim().to_string();
+                    if search_key.is_empty() {
+                        hint(ui, i18n::tr("Пошук за назвою потребує Core API-ключа: вкажіть його в налаштуваннях."));
+                        if ghost_btn(ui, Some(Ic::Gear), "Відкрити налаштування").clicked() {
+                            (self.tab, self.set_sec) = (Tab::Settings, 0);
+                            self.add_open = false;
+                        }
+                    } else {
+                        let mut go = false;
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 110.0).max(160.0);
+                            let r = ui.add(egui::TextEdit::singleline(&mut self.cf_query).hint_text(i18n::tr("Назва мода")).desired_width(w).min_size(egui::vec2(w, 44.0)).align(egui::Align2::LEFT_CENTER));
+                            name_edit(&r, i18n::tr("Назва мода для пошуку на CurseForge"), i18n::tr("Назва мода"), &self.cf_query);
+                            go = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            go |= ui.add_enabled_ui(!self.cf_loading && !self.cf_query.trim().is_empty(), |ui| ghost_btn(ui, None, i18n::tr("Шукати"))).inner.clicked();
+                        });
+                        if go && !self.cf_loading && !self.cf_query.trim().is_empty() {
+                            self.cf_loading = true;
+                            self.add_msg.clear();
+                            let q = self.cf_query.trim().to_string();
+                            self.spawn(ctx, move || Msg::CfSearch(masked(curse_search(&search_key, &q), &[search_key.as_str()])));
+                        }
+                        if self.cf_loading {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                hint(ui, i18n::tr("Шукаємо…"));
+                            });
+                        }
+                        let mut pick = None;
+                        egui::ScrollArea::vertical().id_salt("cf_hits").max_height((ctx.content_rect().height() * 0.3).clamp(120.0, 240.0)).auto_shrink([false, true]).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 8.0;
+                            for (i, h) in self.cf_hits.iter().enumerate() {
+                                let added = self.cfg.projects.iter().any(|q| q.curse_id == h.id);
+                                add_row(ui, &h.icon_url, &h.name, &format!("ID {}", h.id), |ui| {
+                                    if added {
+                                        badge_ic(ui, i18n::tr("Уже додано"), SUCCESS, Some(Ic::Check));
+                                    } else if ghost_btn(ui, None, i18n::tr("btn.add")).clicked() {
+                                        pick = Some(i);
+                                    }
+                                });
+                            }
+                        });
+                        if let Some(i) = pick {
+                            let h = self.cf_hits[i].clone();
+                            cache_icon(&h.icon_url);
+                            self.add_project(Project { name: h.name, curse_id: h.id, icon_url: h.icon_url, ..Default::default() });
+                            self.add_open = false;
+                        }
+                    }
+                }
                 if !self.add_msg.is_empty() {
                     ui.add_space(8.0);
                     banner(ui, Kind::Warn, &self.add_msg);
                 }
+                });
+                // підвал: «Закрити» праворуч під лінією
+                ui.add_space(10.0);
+                let (sep, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+                ui.painter().hline(sep.x_range(), sep.center().y, Stroke::new(1.0, BORDER));
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ghost_btn(ui, None, i18n::tr("btn.close")).clicked() { close = true; }
                 });
             });
         if close || ((self.merge_ask.is_empty() || self.merge_hidden) && r.should_close()) {
