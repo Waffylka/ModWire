@@ -26,7 +26,10 @@ const ACCENT: Color32 = BRAND;
 const BRAND: Color32 = Color32::from_rgb(0xe8, 0xa5, 0x4b);
 const BRAND_INK: Color32 = Color32::from_rgb(0x15, 0x12, 0x0e);
 const ON_ACCENT: Color32 = BRAND_INK;
-const LINK: Color32 = Color32::from_rgb(0xf3, 0xc2, 0x7b);
+// Ролі кольору: бурштин (ACCENT) лише головна дія й «ви тут»; фокус клавіатури завжди світлий (FOCUS) і не схожий на виділення;
+// посилання блідо-блакитні й підкреслені, не бурштинові; зелений і помаранчевий лише платформи.
+const FOCUS: Color32 = TEXT;
+const LINK: Color32 = Color32::from_rgb(0xa9, 0xc7, 0xf0);
 const SUCCESS: Color32 = Color32::from_rgb(0x47, 0xe9, 0xb5);
 // Фірмові кольори платформ для картки проєкту (як у класичній версії): зелений і помаранчевий
 const MR_GREEN: Color32 = Color32::from_rgb(0x1b, 0xd9, 0x6a);
@@ -175,6 +178,7 @@ struct App {
     add_shown: bool,
     file_info: Option<JarInfo>, // метадані файлу для попередження про несумісність
     file_note: String,          // що підставлено з файлу (показується в кроці «Файл»)
+    review_now: bool, // чи цього кадру показано зведення (права картка тоді не дублює його рядки)
     edit_mode: bool, // true = покроковий майстер; false лише після вибору файлу, коли форма вже повна: тоді зведення (не перехоплює форму посеред набору)
     ctrl_armed: Option<(std::time::Instant, Option<usize>)>, // перше Ctrl+Enter на «Публікації» (час, проєкт): друге за 2 с для того ж проєкту відправляє
     splash: splash::Splash,     // заставка на старті
@@ -248,7 +252,7 @@ fn sponsor_tile(ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             badge(ui, i18n::tr("Реклама"), MUTED);
             ui.label(RichText::new(format!("{} · {}", s.title, s.text)).color(MUTED).size(HINT_SZ));
-            let r = ui.add(egui::Button::new(RichText::new(s.cta).color(LINK).size(HINT_SZ)).frame(false).min_size(egui::vec2(0.0, TOUCH_H)));
+            let r = ui.add(egui::Button::new(RichText::new(s.cta).color(LINK).underline().size(HINT_SZ)).frame(false).min_size(egui::vec2(0.0, TOUCH_H)));
             if r.clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(s.url));
             }
@@ -265,7 +269,7 @@ fn split_url(s: &str) -> (String, Option<String>) {
 
 /// Діалог вибору файлу змін; бере першу секцію (останню версію).
 fn pick_changelog(dir: String) -> Option<Msg> {
-    let mut d = rfd::FileDialog::new().add_filter(i18n::tr("Зміни"), &["md", "txt"]);
+    let mut d = rfd::FileDialog::new().add_filter(i18n::tr("Опис змін"), &["md", "txt"]);
     if !dir.is_empty() {
         d = d.set_directory(dir);
     }
@@ -439,7 +443,7 @@ fn combo_box(salt: &str) -> egui::ComboBox<'_> {
 }
 
 fn link(ui: &mut egui::Ui, help: &str, url: &str) {
-    let resp = ui.add(egui::Button::new(RichText::new(i18n::tr("Як отримати")).color(LINK)).frame(false).min_size(egui::vec2(0.0, TOUCH_H)));
+    let resp = ui.add(egui::Button::new(RichText::new(i18n::tr("Як отримати")).color(LINK).underline()).frame(false).min_size(egui::vec2(0.0, TOUCH_H)));
     let resp = aria(resp, i18n::tr("Як отримати: показати інструкцію"));
     egui::Popup::from_toggle_button_response(&resp)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -515,7 +519,7 @@ fn btn_paint(ui: &mut egui::Ui, ic: Option<Ic>, label: &str, kind: BtnKind, min_
     if resp.has_focus() {
         match kind {
             BtnKind::Solid(..) => p.rect_stroke(rect.expand(2.0), R_CTRL + 2, Stroke::new(2.0, TEXT), egui::StrokeKind::Outside),
-            _ => p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside),
+            _ => p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, FOCUS), egui::StrokeKind::Inside),
         };
     }
     let x0 = rect.center().x - content_w / 2.0;
@@ -602,7 +606,7 @@ fn project_row(ui: &mut egui::Ui, name: &str, last: &str, mr: bool, cf: bool, on
     p.rect_filled(rect, r, fill);
     p.rect_stroke(rect, r, Stroke::new(if on { 2.0 } else { 1.0 }, if on { ACCENT } else { UI_BORDER }), egui::StrokeKind::Inside);
     if resp.has_focus() {
-        p.rect_stroke(rect.expand(2.0), r, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+        p.rect_stroke(rect.expand(2.0), r, Stroke::new(2.0, FOCUS), egui::StrokeKind::Outside);
     }
     let sub = if last.trim().is_empty() { "ще не публікувався".to_string() } else { format!("остання версія {}", last.trim()) };
     p.text(egui::pos2(rect.left() + 16.0, rect.center().y + 10.0), egui::Align2::LEFT_CENTER, sub, egui::FontId::proportional(12.0), MUTED);
@@ -635,7 +639,7 @@ fn platform_card(ui: &mut egui::Ui, on: bool, name: &str, col: Color32) -> egui:
     p.rect_filled(rect, r, if on { ACCENT.gamma_multiply(0.12) } else if resp.hovered() { HOVER } else { FIELD });
     p.rect_stroke(rect, r, Stroke::new(if on { 2.0 } else { 1.0 }, if on { ACCENT } else { UI_BORDER }), egui::StrokeKind::Inside);
     if resp.has_focus() {
-        p.rect_stroke(rect.expand(2.0), r, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+        p.rect_stroke(rect.expand(2.0), r, Stroke::new(2.0, FOCUS), egui::StrokeKind::Outside);
     }
     let bx = egui::Rect::from_center_size(egui::pos2(rect.left() + 28.0, rect.center().y), egui::vec2(22.0, 22.0));
     if on {
@@ -745,7 +749,7 @@ fn side_item(ui: &mut egui::Ui, ic: Ic, label: &str, active: bool, dot: Option<C
         p.rect_filled(rect, 10, HOVER);
     }
     if resp.has_focus() {
-        p.rect_stroke(rect, 10, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+        p.rect_stroke(rect, 10, Stroke::new(2.0, FOCUS), egui::StrokeKind::Inside);
     }
     draw_icon(p, egui::pos2(rect.left() + 24.0, rect.center().y), ic, 18.0, if active { ACCENT } else { MUTED });
     p.text(egui::pos2(rect.left() + 46.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.5), if active { TEXT } else { MUTED });
@@ -771,7 +775,7 @@ fn step_tab(ui: &mut egui::Ui, n: usize, label: &str, done: bool, active: bool) 
         p.rect_filled(rect, rr, HOVER);
     }
     if resp.has_focus() {
-        p.rect_stroke(rect, rr, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+        p.rect_stroke(rect, rr, Stroke::new(2.0, FOCUS), egui::StrokeKind::Inside);
     }
     let c = egui::pos2(rect.left() + 8.0 + STEP_DOT / 2.0, rect.center().y);
     // заливка = «ви тут», кільце з галочкою = «готово», сіре кільце = ще ні: місце й повнота читаються різно
@@ -981,6 +985,22 @@ fn warn_row(ui: &mut egui::Ui, text: &str) {
     });
 }
 
+/// Заголовок помилки платформи простою мовою: (текст, чи причина в токені/правах, чи є що показати в «Докладніше»).
+/// Сирий текст сервера лишається за «Докладніше»: 401/403 майже завжди про токен, а не про файл.
+fn error_headline(name: &str, e: &str) -> (String, bool, bool) {
+    // помилка API має вигляд «Порада простою мовою (HTTP 403 Forbidden: тіло відповіді)»: порада йде в заголовок, сире за «Докладніше»
+    if let Some((human, raw)) = e.split_once(" (HTTP ") {
+        let token = raw.starts_with("401") || raw.starts_with("403"); // токен або права (403 також може бути ID проєкту: порада про це вже в тексті)
+        return (format!("{name}: {human}"), token, true);
+    }
+    let short: String = e.split(". ").next().unwrap_or(e).lines().next().unwrap_or("").chars().take(90).collect();
+    if short.trim().is_empty() {
+        return (i18n::fmt(i18n::tr("{}: помилка"), &[&name]), false, false); // без «помилка. » з порожнім хвостом
+    }
+    let long = short.chars().count() < e.chars().count();
+    (i18n::fmt(i18n::tr("{}: помилка. {}{}"), &[&name, &short, &if long { "…" } else { "" }]), false, long)
+}
+
 /// Рамка модального вікна.
 fn modal_frame() -> egui::Frame {
     egui::Frame::new().fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(egui::CornerRadius::same(CARD_R)).inner_margin(egui::Margin::same(24))
@@ -1003,7 +1023,7 @@ fn icon_only(ui: &mut egui::Ui, ic: Ic, tip: &str, on: bool) -> egui::Response {
     let border = if enabled { UI_BORDER.lerp_to_gamma(ACCENT.gamma_multiply(0.6), t) } else { BORDER };
     p.rect(rect, R_CTRL, fill, Stroke::new(1.0, border), egui::StrokeKind::Inside);
     if resp.has_focus() {
-        p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+        p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, FOCUS), egui::StrokeKind::Inside);
     }
     let col = if !enabled { MUTED.gamma_multiply(0.5) } else if on { ACCENT } else { MUTED.lerp_to_gamma(TEXT, t) };
     draw_icon(p, rect.center(), ic, 16.0, col);
@@ -1033,7 +1053,7 @@ fn check_row(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
         draw_icon(p, bx.center(), Ic::Check, 13.0, ON_ACCENT.gamma_multiply(on_t));
     }
     if resp.has_focus() {
-        p.rect_stroke(bx.expand(2.0), R_BADGE + 1, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+        p.rect_stroke(bx.expand(2.0), R_BADGE + 1, Stroke::new(2.0, FOCUS), egui::StrokeKind::Outside);
     }
     if let Some(g) = galley {
         p.galley(egui::pos2(rect.left() + 30.0, rect.center().y - g.size().y / 2.0), g, TEXT);
@@ -1050,7 +1070,7 @@ fn close_x(ui: &mut egui::Ui) -> egui::Response {
         p.rect_filled(rect, R_CTRL, HOVER);
     }
     if resp.has_focus() {
-        p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+        p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, FOCUS), egui::StrokeKind::Inside);
     }
     draw_icon(p, rect.center(), Ic::Cross, 14.0, if resp.hovered() { TEXT } else { MUTED });
     resp.on_hover_text(i18n::tr("btn.close"))
@@ -1093,7 +1113,7 @@ fn choice_sz(ui: &mut egui::Ui, on: bool, label: &str, col: Color32, alpha: f32,
     let p = ui.painter();
     p.rect(rect, R_CTRL, fill, stroke, egui::StrokeKind::Inside);
     if resp.has_focus() {
-        p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+        p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, FOCUS), egui::StrokeKind::Inside);
     }
     // вміст по центру; розмір кнопки не залежить від стану (місце під галочку резервується)
     let content_w = galley.size().x + if on { 18.0 } else { 0.0 };
@@ -1142,7 +1162,7 @@ fn token_field(ui: &mut egui::Ui, value: &mut String, show: &mut bool) -> bool {
                 p.rect_filled(rect, R_CTRL, HOVER);
             }
             if resp.has_focus() {
-                p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+                p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, FOCUS), egui::StrokeKind::Inside);
             }
             let col = if resp.hovered() { TEXT } else { MUTED };
             draw_icon(p, rect.center(), Ic::Eye, 16.0, col);
@@ -1158,7 +1178,7 @@ fn token_field(ui: &mut egui::Ui, value: &mut String, show: &mut bool) -> bool {
     prep.frame.stroke = Stroke::new(1.0, if focused { ACCENT } else { UI_BORDER });
     let resp = prep.end(ui);
     if focused {
-        ui.painter().rect_stroke(resp.rect, R_CTRL, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(resp.rect, R_CTRL, Stroke::new(2.0, FOCUS), egui::StrokeKind::Inside);
     }
     changed
 }
@@ -1202,7 +1222,7 @@ impl App {
         let rt = RELEASE_TYPES.iter().position(|r| *r == l.release_type).unwrap_or(0);
         let mut app = Self {
             tab: if cfg.projects.is_empty() { Tab::Projects } else { Tab::Publish }, // у день релізу відразу робочий екран; без проєктів спершу додати
-            edit_mode: true, tx, rx, add_open: false, target: None, mr_list: vec![], mr_loading: false, mr_msg: String::new(),
+            edit_mode: true, review_now: false, tx, rx, add_open: false, target: None, mr_list: vec![], mr_loading: false, mr_msg: String::new(),
             cf_id: String::new(), cur_name: String::new(), proj_chk: Chk::Idle, featured: false, send_deps: false, extra_files: vec![], mr_link: String::new(), sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), sel, file: None,
             name: String::new(), number: sel.and_then(|i| cfg.projects.get(i)).map(|p| bump(&p.last_number)).unwrap_or_default(), release_type: rt, changelog: String::new(),
             use_mr: true, use_cf: true, mr_res: None, cf_res: None, pending: 0, msg: String::new(),
@@ -1672,7 +1692,7 @@ impl App {
             self.cfg.last.loaders = r.loaders;
         }
         (self.use_mr, self.use_cf, self.mr_res, self.cf_res) = (true, true, None, None);
-        self.tab = Tab::Publish;
+        (self.tab, self.pub_step, self.edit_mode) = (Tab::Publish, 1, true); // з історії на крок «Файл»: його й просить повідомлення нижче
         self.notice = i18n::tr("Форму відновлено із запису історії. Оберіть файл і перевірте зміни.").into();
     }
 
@@ -1867,14 +1887,17 @@ impl App {
     /// Пункт меню «Історія»: та сама сторінка «Публікація», крок історії. Неактивний, поки записів немає.
     fn history_button(&mut self, ui: &mut egui::Ui) {
         let active = self.tab == Tab::Publish && self.pub_step == 6 && !self.history.is_empty();
-        if rail_item(ui, active, !self.history.is_empty(), i18n::tr("nav.history"), "Ctrl+3", Ic::Clock, i18n::tr("Записи з'являться після першої публікації.")) {
+        let tip = if self.pending > 0 { i18n::tr("Дочекайтесь завершення публікації") } else { i18n::tr("Записи з'являться після першої публікації.") };
+        if rail_item(ui, active, !self.history.is_empty() && self.pending == 0, i18n::tr("nav.history"), "Ctrl+3", Ic::Clock, tip) {
             self.open_history();
         }
     }
 
     /// Відкрити історію (Ctrl+3 і клік у меню); без записів нічого не робить.
     fn open_history(&mut self) {
-        if self.history.is_empty() {
+        if self.pending > 0 {
+            self.notice = i18n::tr("Дочекайтесь завершення публікації").into();
+        } else if self.history.is_empty() {
             self.notice = i18n::tr("Історія порожня: записи з'являться після першої публікації.").into(); // Ctrl+3 не мовчить
         } else {
             (self.tab, self.pub_step) = (Tab::Publish, 6);
@@ -1898,7 +1921,7 @@ fn rail_item(ui: &mut egui::Ui, active: bool, enabled: bool, label: &str, key: &
         p.rect_filled(rect, R_CTRL, HOVER.gamma_multiply(hov * (1.0 - act)));
         p.rect_filled(rect, R_CTRL, Color32::from_rgb(0x25, 0x25, 0x27).gamma_multiply(act));
         if resp.has_focus() {
-            p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+            p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, FOCUS), egui::StrokeKind::Inside);
         }
         let (icon_col, text_col) = (MUTED.lerp_to_gamma(ACCENT, act).gamma_multiply(dim), MUTED.lerp_to_gamma(TEXT, act).gamma_multiply(dim));
         draw_icon(p, egui::pos2(rect.left() + 24.0, rect.center().y), kind, 20.0, icon_col);
@@ -2038,41 +2061,20 @@ impl App {
         }
 
         if no_tokens && !no_projects {
-            let (mut to_settings, mut to_add) = (false, false);
-            card(ui, |ui| {
+            // лише те, чого бракує: проєкт уже є, тож рядок «Проєкт додано» і заголовок «Швидкий старт» були зайвими
+            let mut to_settings = false;
+            egui::Frame::new().fill(FIELD).stroke(Stroke::new(1.0, UI_BORDER)).corner_radius(egui::CornerRadius::same(R_CTRL)).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(title(i18n::tr("Швидкий старт")));
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    let chip = |ui: &mut egui::Ui, need: bool, text: &str, done_text: &str, btn: &str, plus: bool| -> bool {
-                        let mut clicked = false;
-                        egui::Frame::new().fill(FIELD).stroke(Stroke::new(1.0, UI_BORDER)).corner_radius(egui::CornerRadius::same(R_CTRL))
-                            .inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.set_min_height(CTRL_H); // рядки з кнопкою і без неї однакової висоти
-                                ui.horizontal_wrapped(|ui| {
-                                    if need { badge_ic(ui, i18n::tr("Потрібно"), ACCENT, Some(Ic::Warn)) } else { badge_ic(ui, i18n::tr("btn.done"), SUCCESS, Some(Ic::Check)) }
-                                    ui.label(if need { text } else { done_text });
-                                    if need {
-                                        clicked = if plus { icon_btn(ui, Some(Ic::Plus), btn, false).clicked() } else { ghost_btn(ui, Some(Ic::Gear), btn).clicked() };
-                                    }
-                                });
-                            });
-                        clicked
-                    };
-                    to_settings = chip(ui, no_tokens, i18n::tr("Вкажіть токен платформи"), i18n::tr("Токен вказано"), i18n::tr("nav.settings"), false);
-                    to_add = chip(ui, no_projects, i18n::tr("Додайте свій мод"), i18n::tr("Проєкт додано"), i18n::tr("btn.add_project"), true);
+                ui.set_min_height(CTRL_H);
+                ui.horizontal_wrapped(|ui| {
+                    badge_ic(ui, i18n::tr("Потрібно"), WARN, Some(Ic::Warn)); // не бурштин: бурштин лише для головної дії
+                    ui.label(i18n::tr("Для публікації потрібен токен Modrinth або CurseForge"));
+                    to_settings = ghost_btn(ui, Some(Ic::Gear), i18n::tr("nav.settings")).clicked();
                 });
-                hint(ui, i18n::tr("Далі: вкладка «Публікація» — файл, версія, зміни, і готово."));
             });
             ui.add_space(12.0);
             if to_settings {
                 (self.tab, self.set_sec) = (Tab::Settings, 0);
-            }
-            if to_add {
-                self.add_open = true;
-                self.target = None;
-                self.add_msg.clear();
             }
         }
 
@@ -2182,11 +2184,14 @@ impl App {
                                 // кнопки притиснуті донизу: bottom_up у решті висоти картки
                                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                                     let row = |ui: &mut egui::Ui| {
-                                        if ui.add(primary(i18n::tr("btn.publish"))).clicked() { publish = Some(i); }
                                         if confirm == Some(i) {
+                                            // підтвердження замінює дії картки: «Точно видалити?» не стоїть упритул до «Опублікувати»
                                             if ui.add(danger(i18n::tr("Точно видалити?"))).clicked() { delete = Some(i); }
                                             if ghost_btn(ui, Some(Ic::Cross), i18n::tr("btn.cancel")).clicked() { cancel = true; }
                                         } else {
+                                            // бурштинова лише в проєкту, з яким працюють зараз; в інших тиха
+                                            let go = if self.sel == Some(i) { ui.add(primary(i18n::tr("btn.publish"))) } else { ghost_btn(ui, None, i18n::tr("btn.publish")) };
+                                            if go.clicked() { publish = Some(i); }
                                             if aria(icon_only(ui, Ic::Copy, i18n::tr("Дублювати проєкт: копія з тими самими налаштуваннями"), false), i18n::fmt(i18n::tr("Дублювати проєкт «{}»"), &[&(p.name)])).clicked() { dup = Some(i); }
                                             if aria_check(icon_only(ui, Ic::Pin, if p.pinned { i18n::tr("Відкріпити") } else { i18n::tr("Закріпити: закріплені проєкти йдуть першими") }, p.pinned), i18n::fmt(i18n::tr("Закріпити проєкт «{}»"), &[&(p.name)]), p.pinned).clicked() { pin = Some(i); }
                                             if ui.add_enabled_ui(self.pending == 0 && self.adding == 0, |ui| aria(icon_only(ui, Ic::Trash, i18n::tr("Видалити запис у Modwire"), false), i18n::fmt(i18n::tr("Видалити проєкт «{}» зі списку Modwire"), &[&(p.name)]))).inner.on_disabled_hover_text(i18n::tr("Недоступно, поки триває публікація або додавання")).clicked() {
@@ -2585,7 +2590,7 @@ impl App {
 
     /// Степер публікації: кожен крок — окрема вкладка; галочка — крок заповнено, пілюля — активний.
     fn publish_tabs(&mut self, ui: &mut egui::Ui, done: &[bool; 6]) {
-        let names = [i18n::tr("Проєкт"), i18n::tr("Файл"), i18n::tr("Версія"), i18n::tr("Сумісність"), i18n::tr("Зміни"), i18n::tr("Куди публікувати")];
+        let names = [i18n::tr("Проєкт"), i18n::tr("Файл"), i18n::tr("Версія"), i18n::tr("Сумісність"), i18n::tr("Опис змін"), i18n::tr("Куди публікувати")];
         egui::Frame::new().fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).corner_radius(CARD_R).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add_enabled_ui(self.pending == 0, |ui| ui.horizontal_wrapped(|ui| {
@@ -2604,7 +2609,8 @@ impl App {
 
     /// Зведення замість майстра, коли все заповнено: що піде на сайти, і «Змінити» біля кожного рядка (клавіатурою теж).
     fn review_card(&mut self, ui: &mut egui::Ui, sum: &[String; 6]) {
-        let names = [i18n::tr("Проєкт"), i18n::tr("Файл"), i18n::tr("Версія"), i18n::tr("Сумісність"), i18n::tr("Зміни"), i18n::tr("Куди публікувати")];
+        // «Опис змін», а не «Зміни»: поруч стоїть кнопка «Змінити», і два схожі слова плутали
+        let names = [i18n::tr("Проєкт"), i18n::tr("Файл"), i18n::tr("Версія"), i18n::tr("Сумісність"), i18n::tr("Опис змін"), i18n::tr("Куди публікувати")];
         card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(i18n::tr("Перевірте перед публікацією")).size(20.0).color(TEXT));
@@ -2618,16 +2624,26 @@ impl App {
             ui.add_enabled_ui(self.pending == 0, |ui| {
             for (i, n) in names.iter().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(egui::vec2(120.0, CTRL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| ui.label(RichText::new(*n).color(MUTED).size(HINT_SZ)));
+                    ui.allocate_ui_with_layout(egui::vec2(120.0, TOUCH_H), egui::Layout::left_to_right(egui::Align::Center), |ui| ui.label(RichText::new(*n).color(MUTED).size(HINT_SZ)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if aria(ghost_btn(ui, None, i18n::tr("Змінити")), i18n::fmt(i18n::tr("Змінити крок «{}»"), &[n])).clicked() {
+                        // «Змінити» як посилання (28 px, а не рамкова кнопка 36 px): шість рядків вміщаються і у вікні 480 px
+                        let b = ui.add(egui::Button::new(RichText::new(i18n::tr("Змінити")).color(LINK).underline()).frame(false).min_size(egui::vec2(0.0, TOUCH_H)));
+                        if aria(b.on_hover_cursor(egui::CursorIcon::PointingHand), i18n::fmt(i18n::tr("Змінити крок «{}»"), &[n])).clicked() {
                             (self.pub_step, self.edit_mode) = (i, true);
                         }
                         let v = if sum[i].trim().is_empty() { "—" } else { sum[i].as_str() };
                         ui.add(egui::Label::new(RichText::new(v).color(if sum[i].trim().is_empty() { MUTED } else { TEXT })).truncate());
                     });
                 });
-                if i + 1 < names.len() { row_sep(ui); }
+                if i + 1 < names.len() {
+                    if ui.ctx().content_rect().height() < 600.0 {
+                        // низьке вікно: тонкий розділювач без зайвих відступів
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+                        ui.painter().hline(r.x_range(), r.center().y, Stroke::new(1.0, BORDER));
+                    } else {
+                        row_sep(ui);
+                    }
+                }
             }
             });
         });
@@ -2651,7 +2667,8 @@ impl App {
             ui.add_space(6.0);
             ui.label(title(name));
             ui.add_space(4.0);
-            ui.scope(|ui| {
+            // у зведенні ліворуч ці самі рядки вже показано: на широкому вікні права картка їх не дублює
+            if !self.review_now { ui.scope(|ui| {
                 ui.spacing_mut().interact_size.y = 16.0;
                 ui.spacing_mut().item_spacing.y = 6.0;
                 for (k, v) in rows {
@@ -2663,7 +2680,7 @@ impl App {
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(i18n::tr("Зміни")).color(MUTED).size(HINT_SZ));
+                    ui.label(RichText::new(i18n::tr("Опис змін")).color(MUTED).size(HINT_SZ));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.changelog.trim().is_empty() {
                             // опис необов'язковий: приглушено, без тривожного кольору
@@ -2674,7 +2691,7 @@ impl App {
                         }
                     });
                 });
-            });
+            }); }
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 if has_mr && self.use_mr { brand_pill(ui, "Modrinth", MR_GREEN, MR_BG); }
@@ -2685,7 +2702,37 @@ impl App {
         });
     }
 
+    /// Відкрита сторінка історії (пункт меню «Історія»): без майстра й панелі публікації.
+    fn history_page(&self) -> bool {
+        // focus_hist («До історії» після публікації) відкриває сторінку з першого ж кадру, без спалаху майстра
+        // під час відправки сторінки історії немає: на ній не видно ні прогресу, ні «Скасувати» (на широкому вікні нижньої панелі нема взагалі)
+        self.tab == Tab::Publish && (self.pub_step == 6 || self.focus_hist) && !self.history.is_empty() && self.pending == 0
+    }
+
+    /// Окрема сторінка історії: свій заголовок і шлях назад, без стрічки кроків і без кнопки «Опублікувати».
+    fn history_ui(&mut self, ui: &mut egui::Ui) {
+        self.pub_step = 6;
+        ui.horizontal(|ui| {
+            ui.heading(i18n::fmt(i18n::tr("Історія · {}"), &[&(self.history.len())]));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ghost_btn(ui, Some(Ic::Upload), i18n::tr("До публікації")).clicked() {
+                    self.pub_step = 5;
+                }
+            });
+        });
+        hint(ui, i18n::tr("Усі публікації з цього комп'ютера. «Повторити з цього запису» підставляє його у форму."));
+        // помилка дії на цій сторінці (напр. не вдалося очистити історію): нижньої панелі тут немає, тож показуємо її самі
+        if !self.msg.is_empty() {
+            banner(ui, Kind::Warn, &self.msg.clone());
+        }
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.publish_extras(ui));
+    }
+
     fn publish_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.history_page() {
+            return self.history_ui(ui);
+        }
         ui.heading(i18n::tr("nav.publish"));
         if !self.cfg.projects.is_empty() && self.cfg.modrinth_token.trim().is_empty() && self.cfg.curse_token.trim().is_empty() {
             banner(ui, Kind::Warn, i18n::tr("Токени ще не вказано: заповнити форму можна, але надіслати файл — ні."));
@@ -2740,6 +2787,7 @@ impl App {
         let all_done = [0, 1, 2, 3, 5].iter().all(|&i| done[i]);
         if !all_done { self.edit_mode = true; } // неповна форма завжди в майстрі: зведення не перехоплює її посеред набору
         let review = all_done && !self.edit_mode && self.pub_step != 6;
+        self.review_now = review;
         // у зведенні стрічка кроків лише забирає висоту (усі галочки, а «Змінити» біля рядка робить те саме)
         if !review {
             self.publish_tabs(ui, &done);
@@ -2880,7 +2928,7 @@ impl App {
                 self.step_nav(ui);
             }); }
 
-            if self.pub_step == 4 { step(ui, sp(4, i18n::tr("Зміни"), false), &mut open[4], |ui| {
+            if self.pub_step == 4 { step(ui, sp(4, i18n::tr("Опис змін"), false), &mut open[4], |ui| {
                 let lid = field_label(ui, i18n::tr("Що змінилось"));
                 ui.add(egui::TextEdit::multiline(&mut self.changelog).hint_text(i18n::tr("Можна списки (- пункт) і **жирний** текст")).desired_rows(4).desired_width(f32::INFINITY)).labelled_by(lid);
                 if self.changelog.trim().is_empty() && self.file.is_some() {
@@ -3009,7 +3057,7 @@ impl App {
 
     /// Підвал кроку: «Назад» ліворуч, «Далі: <наступний крок>» праворуч.
     fn step_nav(&mut self, ui: &mut egui::Ui) {
-        let names = [i18n::tr("Проєкт"), i18n::tr("Файл"), i18n::tr("Версія"), i18n::tr("Сумісність"), i18n::tr("Зміни"), i18n::tr("Куди публікувати")];
+        let names = [i18n::tr("Проєкт"), i18n::tr("Файл"), i18n::tr("Версія"), i18n::tr("Сумісність"), i18n::tr("Опис змін"), i18n::tr("Куди публікувати")];
         let d = self.steps_done();
         row_sep(ui);
         ui.horizontal(|ui| {
@@ -3040,7 +3088,7 @@ impl App {
         let ready = self.check(mr, cf);
         let busy = self.pending > 0;
         let bars: Vec<(&str, f32, Color32, String)> = if busy {
-            [("Modrinth", &self.up_mr, &self.mr_res, MR_GREEN), ("CurseForge", &self.up_cf, &self.cf_res, CF_COL)]
+            [("Modrinth", &self.up_mr, &self.mr_res, MR_GREEN), ("CurseForge", &self.up_cf, &self.cf_res, CF_ORANGE)]
                 .into_iter()
                 .filter_map(|(n, up, res, col)| {
                     let total = up.prog.total.load(Relaxed);
@@ -3081,9 +3129,19 @@ impl App {
                                 Some(Ok(_)) => icon_label_c(ui, Ic::Check, SUCCESS, name, TEXT),
                                 Some(Err(e)) => {
                                     // причина в рядку, а не лише «помилка»: повний текст за «Докладніше»
-                                    let short: String = e.split(". ").next().unwrap_or(e).lines().next().unwrap_or("").chars().take(40).collect();
-                                    let long = short.chars().count() < e.chars().count();
-                                    icon_label_c(ui, Ic::Cross, ERROR, &i18n::fmt(i18n::tr("{}: помилка. {}{}"), &[&(name), &(short), &(if long { "…" } else { "" })]), TEXT)
+                                    let (head, token, _) = error_headline(name, e);
+                                    // у вузькому рядку повний заголовок обрізався б посередині поради: для токена коротша форма
+                                    let head = if token {
+                                        // 403 може бути і про ID проєкту, 401 лише про токен
+                                        let k = if e.contains("(HTTP 403") { i18n::tr("{}: немає доступу. Перевірте токен і ID проєкту.") } else { i18n::tr("{}: токен не підійшов. Перевірте його.") };
+                                        i18n::fmt(k, &[&name])
+                                    } else if head.chars().count() > 60 {
+                                        let s: String = e.split(". ").next().unwrap_or(e).lines().next().unwrap_or("").chars().take(40).collect();
+                                        format!("{name}: {s}{}", if s.chars().count() < e.chars().count() { "…" } else { "" })
+                                    } else {
+                                        head
+                                    };
+                                    icon_label_c(ui, Ic::Cross, ERROR, &head, TEXT)
                                 }
                                 None => {}
                             };
@@ -3128,13 +3186,15 @@ impl App {
                             });
                         }
                         Some(Err(e)) => {
-                            // коротко в рядку, повний текст за «Докладніше»
-                            let short: String = e.split(". ").next().unwrap_or(e).chars().take(90).collect();
-                            let long = short.chars().count() < e.chars().count();
+                            // простою мовою в рядку, сирий текст сервера за «Докладніше»
+                            let (head, token, long) = error_headline(name, e);
                             let det_id = egui::Id::NULL.with(("res_detail", name));
                             let open = ctx.data_mut(|d| d.get_temp::<bool>(det_id)).unwrap_or(false);
                             ui.horizontal_wrapped(|ui| {
-                                icon_label_c(ui, Ic::Cross, ERROR, &i18n::fmt(i18n::tr("{}: помилка. {}{}"), &[&(name), &(short), &(if long { "…" } else { "" })]), TEXT);
+                                icon_label_c(ui, Ic::Cross, ERROR, &head, TEXT);
+                                if token && ghost_btn(ui, Some(Ic::Gear), i18n::tr("До налаштувань")).clicked() {
+                                    (self.tab, self.set_sec) = (Tab::Settings, 0);
+                                }
                                 if long && aria(ghost_btn(ui, None, if open { i18n::tr("btn.hide") } else { i18n::tr("btn.details") }), i18n::fmt(i18n::tr("{} текст помилки {}"), &[&(if open { i18n::tr("Сховати") } else { i18n::tr("Показати") }), &(name)])).clicked() {
                                     ctx.data_mut(|d| d.insert_temp(det_id, !open));
                                 }
@@ -3179,30 +3239,30 @@ impl App {
         // у вузькому вікні — один рядок (підсумок і кнопка); два рядки лише під час публікації, де є кнопки «Скасувати»
         if card {
             ui.vertical(|ui| {
-                ui.horizontal_wrapped(|ui| self.bar_summary(ui, busy, &ready, mr, cf));
+                ui.horizontal_wrapped(|ui| self.bar_summary(ui, busy, &ready, mr, cf, true));
                 ui.add_space(8.0);
                 let w = ui.available_width();
                 if ui.add_enabled(can, primary(&label).min_size(egui::vec2(w, 44.0))).on_disabled_hover_text(why).clicked() {
                     self.start_publish(ctx, mr, cf);
                 }
             });
-        } else if narrow && busy {
-            // вимкнена «Публікація…» нічого не дає: у вузькому вікні лише статус і «Скасувати» (панель ≤30% висоти)
-            ui.horizontal_wrapped(|ui| self.bar_summary(ui, busy, &ready, mr, cf));
+        } else if busy {
+            // вимкнена «Публікація…» нічого не дає й налазила б на кнопки «Скасувати»: під час відправки лише статус і «Скасувати»
+            ui.horizontal_wrapped(|ui| self.bar_summary(ui, busy, &ready, mr, cf, false));
         } else {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(can, mk()).on_disabled_hover_text(why).clicked() {
                         self.start_publish(ctx, mr, cf);
                     }
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| self.bar_summary(ui, busy, &ready, mr, cf));
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| self.bar_summary(ui, busy, &ready, mr, cf, false));
                 });
             });
         }
     }
 
     /// Підсумок у нижній панелі: прогрес, готовність або причина.
-    fn bar_summary(&mut self, ui: &mut egui::Ui, busy: bool, ready: &Result<(), String>, mr: bool, cf: bool) {
+    fn bar_summary(&mut self, ui: &mut egui::Ui, busy: bool, ready: &Result<(), String>, mr: bool, cf: bool, in_card: bool) {
         if busy {
             // слот висотою з кнопку: у horizontal_wrapped рядок виростає лише з появою кнопок, і спінер без нього з'їжджає вниз
             let (slot, _) = ui.allocate_exact_size(egui::vec2(18.0, 38.0), egui::Sense::hover());
@@ -3210,12 +3270,12 @@ impl App {
             let running: Vec<(&str, &Up)> = [("Modrinth", &self.up_mr), ("CurseForge", &self.up_cf)].into_iter().filter(|(_, u)| u.active.load(Relaxed)).collect();
             ui.label(if running.iter().all(|(_, u)| u.cancel.load(Relaxed)) { i18n::tr("Скасування…") } else { i18n::tr("Надсилаємо файл, зачекайте…") });
             let many = running.len() > 1;
-            let tight = ui.available_width() < 560.0; // вузьке вікно: лише назва платформи, повний текст у підказці
+            let tight = ui.available_width() < 460.0; // після спінера й тексту лишилось мало місця: лише назва платформи (повна назва й для скрінрідера, і в підказці)
             for (n, u) in running {
                 let cancelling = u.cancel.load(Relaxed);
                 let full = if many { i18n::fmt(i18n::tr("Скасувати {}"), &[&(n)]) } else { i18n::tr("btn.cancel").to_string() };
                 let label = if many && tight { n.to_string() } else { full.clone() };
-                if ui.add_enabled_ui(!cancelling, |ui| ghost_btn(ui, Some(Ic::Cross), &label)).inner.on_hover_text(full).clicked() {
+                if ui.add_enabled_ui(!cancelling, |ui| aria(ghost_btn(ui, Some(Ic::Cross), &label), full.clone())).inner.on_hover_text(full).clicked() {
                     u.cancel.store(true, Relaxed);
                 }
             }
@@ -3236,14 +3296,17 @@ impl App {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         // ✓ «усе гаразд» лише без попереджень; з попередженнями рядок «що й куди» нейтральний, а попередження йдуть окремо під ним
+                        // у правій картці назву проєкту й платформи вже показано вище: повторювати їх тут (і обрізати) не треба
                         if warns.is_empty() {
-                            icon_label_c(ui, Ic::Check, SUCCESS, &txt, SUCCESS);
-                            if let Some(p) = p.filter(|_| ui.ctx().content_rect().height() >= 600.0) {
+                            icon_label_c(ui, Ic::Check, SUCCESS, if in_card { i18n::tr("Готово до публікації") } else { &txt }, SUCCESS);
+                            if let Some(p) = p.filter(|_| !in_card && ui.ctx().content_rect().height() >= 600.0) {
                                 let full = release_summary(&p.name, &self.release(), mr0, cf0);
                                 ui.add(egui::Label::new(RichText::new(&full).color(MUTED).size(HINT_SZ)).truncate()).on_hover_text(full);
                             }
                         } else {
-                            ui.add(egui::Label::new(RichText::new(&txt).color(TEXT)).truncate());
+                            if !in_card {
+                                ui.add(egui::Label::new(RichText::new(&txt).color(TEXT)).truncate());
+                            }
                             for w in &warns {
                                 warn_row(ui, w);
                             }
@@ -3278,7 +3341,7 @@ impl App {
                 let found =history_filter(&self.history, &self.hist_q, self.hist_fail);
                 let limit = if self.hist_all { usize::MAX } else { 10 };
                 let total = found.len();
-                egui::CollapsingHeader::new(title(i18n::fmt(i18n::tr("Історія · {}"), &[&(self.history.len())]))).default_open(true).show(ui, |ui| {
+                ui.scope(|ui| { // заголовок «Історія · N» тепер над сторінкою, тож згортання не потрібне
                     ui.horizontal_wrapped(|ui| {
                         let r = ui.add(egui::TextEdit::singleline(&mut self.hist_q).hint_text(i18n::tr("Пошук: проєкт, номер, платформа, текст")).min_size(egui::vec2(0.0, CTRL_H)).desired_width(340.0_f32.min(ui.available_width() - 8.0)));
                         name_edit(&r, i18n::tr("Пошук в історії публікацій"), i18n::tr("Пошук: проєкт, номер, платформа, текст"), &self.hist_q);
@@ -3334,7 +3397,7 @@ impl App {
                                 if let Some(u) = history_link(e) {
                                     ui.horizontal(|ui| {
                                         for (label, copy) in [(i18n::tr("btn.open"), false), (i18n::tr("btn.copy_link"), true)] {
-                                            let r = ui.add(egui::Label::new(RichText::new(label).color(ACCENT).size(HINT_SZ)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+                                            let r = ui.add(egui::Label::new(RichText::new(label).color(LINK).underline().size(HINT_SZ)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
                                             if r.clicked() {
                                                 if copy { ui.ctx().copy_text(u.clone()); copied = true; } else { ui.ctx().open_url(egui::OpenUrl::new_tab(u.clone())); }
                                             }
@@ -3342,7 +3405,7 @@ impl App {
                                     });
                                 }
                                 if e["number"].as_str().is_some_and(|n| !n.is_empty()) && self.pending == 0 {
-                                    let r = ui.add(egui::Label::new(RichText::new(i18n::tr("Повторити з цього запису")).color(ACCENT).size(HINT_SZ)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    let r = ui.add(egui::Label::new(RichText::new(i18n::tr("Повторити з цього запису")).color(LINK).underline().size(HINT_SZ)).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand);
                                     if r.on_hover_text(i18n::tr("Підставити проєкт, номер, тип, MC і лоадери у форму публікації")).clicked() {
                                         again = Some((*e).clone());
                                     }
@@ -3410,7 +3473,8 @@ impl App {
 
     /// Попередження, які не блокують публікацію, але мають бути видні до неї: токен не перевірено, версія нижча за попередню.
     fn pre_warnings(&self, mr: bool, cf: bool) -> Vec<String> {
-        let mut w: Vec<String> = unchecked_tokens(mr, cf, self.cfg.modrinth_checked, self.cfg.curse_checked).into_iter().collect();
+        // для платформи, куди вже була спроба відправки, «токен не перевірено» застаріле (результат уже показано); для решти лишається
+        let mut w: Vec<String> = unchecked_tokens(mr && self.mr_res.is_none(), cf && self.cf_res.is_none(), self.cfg.modrinth_checked, self.cfg.curse_checked).into_iter().collect();
         // після часткового успіху «версію вже опубліковано» було б хибним: повтор для другої платформи й є наступним кроком
         let partial_ok = matches!(self.mr_res, Some(Ok(_))) || matches!(self.cf_res, Some(Ok(_)));
         if let Some(p) = self.sel.and_then(|i| self.cfg.projects.get(i)).filter(|_| !partial_ok) {
@@ -3578,10 +3642,10 @@ impl App {
         card(ui, |ui| {
             ui.set_width(ui.available_width());
             acc_head(ui, "CurseForge", CF_ORANGE, &self.cfg.curse_token, "1. Увійдіть на CurseForge.\n2. Account > API Tokens.\n3. Створіть токен (Generate token) і скопіюйте.\n4. Вставте сюди.", "https://www.curseforge.com/account/api-tokens");
-            hint(ui, "Токен для завантаження файлів (Upload API token).");
+            hint(ui, i18n::tr("Токен для завантаження файлів (Upload API token): його видають у налаштуваннях облікового запису CurseForge."));
             ui.add_space(8.0);
             let checking = self.cf_msg == Chk::Checking;
-            let (edited, go) = token_row(ui, "Upload-токен", &mut self.cfg.curse_token, &mut self.show_tokens, checking, "Перевірити токен CurseForge");
+            let (edited, go) = token_row(ui, i18n::tr("Токен завантаження"), &mut self.cfg.curse_token, &mut self.show_tokens, checking, "Перевірити токен CurseForge");
             if edited {
                 self.cfg.curse_checked = 0;
                 *changed = true;
@@ -3968,7 +4032,8 @@ impl eframe::App for App {
             let (has_mr, has_cf) = proj.map_or((false, false), |p| (!p.modrinth_id.is_empty(), !p.curse_id.is_empty()));
             let (mr, cf) = (has_mr && self.use_mr, has_cf && self.use_cf);
             // з іншого розділу Ctrl+Enter лише відкриває «Публікацію» (видно підсумок), щоб не відправляти наосліп
-            let was_publish = self.tab == Tab::Publish;
+            // сторінка історії не «Публікація»: на ній немає ні підсумку, ні підказки «ще раз», тож публікувати звідти наосліп не можна
+            let was_publish = self.tab == Tab::Publish && !self.history_page();
             self.tab = Tab::Publish;
             if !was_publish { (self.ctrl_armed, self.pub_step) = (None, if self.pub_step == 6 { 5 } else { self.pub_step }); }
             if was_publish && self.check(mr, cf).is_ok() {
@@ -3999,7 +4064,7 @@ impl eframe::App for App {
         let rail_w = if ctx.content_rect().width() < 860.0 { RAIL_W - 16.0 } else { RAIL_W };
         let side = ((ctx.content_rect().width() - rail_w - CONTENT_MAX_W) / 2.0).max(24.0).floor();
         let pad_y = if ctx.content_rect().height() < 600.0 { 6.0 } else { 10.0 }; // низьке вікно: панель ≤30% висоти
-        let bar_rect = (self.tab == Tab::Publish && !self.cfg.projects.is_empty() && !pub_side(ctx)).then(|| {
+        let bar_rect = (self.tab == Tab::Publish && !self.cfg.projects.is_empty() && !pub_side(ctx) && !self.history_page()).then(|| {
             let h = ctx.data_mut(|d| d.get_temp::<f32>(bar_id)).unwrap_or(64.0);
             egui::Panel::bottom("publish_bar")
                 .frame(egui::Frame::new().fill(SURFACE).stroke(Stroke::new(1.0, BORDER)).inner_margin(egui::Margin::symmetric(24, pad_y as i8)))
@@ -4171,6 +4236,48 @@ mod tests {
         app.set_file(std::path::PathBuf::from("b.jar"), None);
         draw(&mut app);
         assert!(!app.edit_mode, "вибір файлу при повній формі вмикає зведення");
+    }
+
+    #[test]
+    fn token_errors_get_a_plain_headline_with_raw_text_behind_details() {
+        // справжній формат API: порада простою мовою, потім « (HTTP код: тіло)»
+        let (h, token, long) = super::error_headline("CurseForge", "Немає доступу до проєкту. Перевірте токен і ID проєкту (HTTP 403 Forbidden: access denied)");
+        assert!(token && long && h.starts_with("CurseForge: Немає доступу") && !h.contains("403") && !h.contains("access denied"), "{h}");
+        let (_, token, _) = super::error_headline("Modrinth", "Токен недійсний (HTTP 401 Unauthorized: x)");
+        assert!(token, "401 теж про токен");
+        // «HTTP 401» у тілі відповіді 500 не робить помилку токенною
+        let (_, token, _) = super::error_headline("Modrinth", "Помилка на боці сервера (HTTP 500 Internal: тіло містить (HTTP 401)");
+        assert!(!token);
+        let (h, token, long) = super::error_headline("Modrinth", "Файл завеликий");
+        assert!(!token && !long && h.contains("Файл завеликий"), "{h}");
+        assert!(!super::error_headline("Modrinth", "").0.is_empty());
+    }
+
+    #[test]
+    fn history_is_its_own_page_and_token_warning_is_per_platform() {
+        let (_g, mut app) = test_app("histpage");
+        app.sel = Some(0);
+        app.open_history();
+        assert!(!app.history_page(), "порожня історія сторінки не відкриває");
+        app.history = vec![serde_json::json!({"ok": true, "project": "a", "number": "1.0", "platform": "Modrinth", "t": 1, "msg": ""})];
+        app.open_history();
+        assert!(app.history_page() && app.pub_step == 6);
+        app.tab = Tab::Projects;
+        assert!(!app.history_page());
+        // «токен не перевірено» зникає лише для платформи, куди вже була спроба відправки
+        (app.cfg.modrinth_checked, app.cfg.curse_checked) = (0, 0);
+        assert!(app.pre_warnings(true, true).iter().any(|w| w.contains("Modrinth і CurseForge")));
+        app.mr_res = Some(Ok("ok".into()));
+        let w = app.pre_warnings(true, true);
+        assert!(w.iter().any(|w| w.contains("CurseForge") && !w.contains("Modrinth")), "{w:?}");
+        // невдала спроба теж знімає попередження для цієї платформи (результат помилки вже показано)
+        app.mr_res = Some(Err("x".into()));
+        assert!(app.pre_warnings(true, false).is_empty(), "Modrinth уже пробували, CurseForge вимкнено");
+        // без запису про відправку немає сторінки історії: під час публікації її не відкривають
+        app.mr_res = None;
+        app.pending = 1;
+        app.open_history();
+        assert!(!app.history_page(), "під час відправки історія недоступна");
     }
 
     #[test]

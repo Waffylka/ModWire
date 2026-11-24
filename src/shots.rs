@@ -222,7 +222,7 @@ pub fn tick(app: &mut App, ctx: &egui::Context) {
         icon_sheet(ctx);
     }
     st.frame += 1;
-    if scene.ends_with("_focus") && [6, 10, 14, 18, 22].contains(&st.frame) {
+    if scene.ends_with("_focus") && [6, 10, 14, 18, 22, 26].contains(&st.frame) {
         ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::Next));
     }
     if st.frame == 30 {
