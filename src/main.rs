@@ -165,6 +165,9 @@ struct App {
     mc_next: Option<std::time::Instant>,
     cf_msg: Chk,
     key_msg: Chk,
+    ver_open: bool, // вікно вибору версій Minecraft
+    ver_q: String,  // пошук у ньому
+    ver_filter: u8, // 0 релізи, 1 знімки, 2 усі
     upd_drawn: bool, // банер оновлення вже намальовано в цьому кадрі
     set_sec: usize, // розділ налаштувань: 0 записи, 1 дані, 2 оновлення, 3 безпека, 4 про застосунок
     pub_step: usize, // активна вкладка публікації: 0..=5 — кроки, 6 — історія
@@ -576,6 +579,64 @@ struct StepSpec<'a> {
     summary: &'a str,
     scroll: bool, // прокрутити до цього кроку й розгорнути
     tabbed: bool, // крок показано як окрему вкладку: без згортання й з'єднувача
+}
+
+/// Група версії для списку: «1.20» для 1.20.4, «Знімки» для всього, що не схоже на реліз.
+fn mc_group(v: &str) -> String {
+    if let Some(rest) = v.strip_prefix("1.") {
+        let minor: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !minor.is_empty() && (rest.len() == minor.len() || rest[minor.len()..].starts_with('.')) {
+            return format!("1.{minor}");
+        }
+    }
+    "Знімки".to_string()
+}
+
+/// Рядок версії у вікні вибору: галочка й номер.
+fn ver_row(ui: &mut egui::Ui, v: &str, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, v.to_string()));
+    let p = ui.painter();
+    if on {
+        p.rect_filled(rect, R_CTRL, ACCENT.gamma_multiply(0.12));
+    } else if resp.hovered() {
+        p.rect_filled(rect, R_CTRL, HOVER);
+    }
+    if resp.has_focus() {
+        p.rect_stroke(rect, R_CTRL, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+    }
+    let bx = egui::Rect::from_center_size(egui::pos2(rect.left() + 20.0, rect.center().y), egui::vec2(20.0, 20.0));
+    if on {
+        p.rect_filled(bx, R_BADGE, ACCENT);
+        draw_icon(p, bx.center(), Ic::Check, 12.0, ON_ACCENT);
+    } else {
+        p.rect_stroke(bx, R_BADGE, Stroke::new(1.5, UI_BORDER), egui::StrokeKind::Inside);
+    }
+    p.text(egui::pos2(rect.left() + 40.0, rect.center().y), egui::Align2::LEFT_CENTER, v, egui::FontId::proportional(14.0), TEXT);
+    resp
+}
+
+/// Картка типу файлу (мод / ресурс-пак / датапак): назва й підпис, вибрана — акцентна рамка.
+fn kind_card(ui: &mut egui::Ui, on: bool, name: &str, sub: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 60.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, format!("{name}: {sub}")));
+    let p = ui.painter();
+    let r = egui::CornerRadius::same(CARD_R.saturating_sub(2));
+    p.rect_filled(rect, r, if on { ACCENT.gamma_multiply(0.12) } else if resp.hovered() { HOVER } else { FIELD });
+    p.rect_stroke(rect, r, Stroke::new(if on { 2.0 } else { 1.0 }, if on { ACCENT } else { UI_BORDER }), egui::StrokeKind::Inside);
+    if resp.has_focus() {
+        p.rect_stroke(rect.expand(2.0), r, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+    }
+    p.text(egui::pos2(rect.left() + 14.0, rect.center().y - 9.0), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(14.5), TEXT);
+    p.text(egui::pos2(rect.left() + 14.0, rect.center().y + 11.0), egui::Align2::LEFT_CENTER, sub, egui::FontId::proportional(12.0), MUTED);
+    let bx = egui::Rect::from_center_size(egui::pos2(rect.right() - 22.0, rect.center().y), egui::vec2(22.0, 22.0));
+    if on {
+        p.rect_filled(bx, R_BADGE, ACCENT);
+        draw_icon(p, bx.center(), Ic::Check, 13.0, ON_ACCENT);
+    } else {
+        p.rect_stroke(bx, R_BADGE, Stroke::new(1.5, UI_BORDER), egui::StrokeKind::Inside);
+    }
+    resp
 }
 
 /// Чи є місце для правої картки публікації (тоді нижньої панелі немає). Одна умова для ui() і publish_ui().
@@ -1111,11 +1172,6 @@ fn choice_col(ui: &mut egui::Ui, on: bool, label: &str, col: Color32, alpha: f32
     choice_sz(ui, on, label, col, alpha, CTRL_H, egui::TextStyle::Button.resolve(ui.style()))
 }
 
-/// Чип версії Minecraft: нижчий (28) і дрібніший (13).
-fn mc_chip(ui: &mut egui::Ui, on: bool, label: &str) -> egui::Response {
-    choice_sz(ui, on, label, ACCENT, 0.20, CTRL_H, egui::TextStyle::Button.resolve(ui.style()))
-}
-
 fn choice_sz(ui: &mut egui::Ui, on: bool, label: &str, col: Color32, alpha: f32, h: f32, font: egui::FontId) -> egui::Response {
     let enabled = ui.is_enabled();
     let txt_col = if enabled { TEXT } else { MUTED };
@@ -1253,7 +1309,7 @@ impl App {
                 Load::Recovered =>i18n::tr("Конфіг було пошкоджено: копію збережено в теці конфігу (файл .bak), налаштування скинуто.").into(),
                 Load::ReadOnly => i18n::tr("Не вдалося прочитати конфіг: збереження вимкнено, щоб не перезаписати старі дані. Закрийте програми, що тримають файл, і перезапустіть.").into(),
             },
-            readonly: matches!(state, Load::ReadOnly), adding: 0, cf_auto_off: false, cur_idx: None, history: history_load(HIST_MAX), hist_q: String::new(), hist_fail: false, hist_all: false, hist_confirm: false, cur: Default::default(), mc_known: vec![], mc_all: vec![], mc_loading: false, mc_next: None, cf_msg: checked_msg(cfg.curse_checked), key_msg: checked_msg(cfg.core_checked), merge_hidden: false, add_shown: false, file_note: String::new(), ctrl_armed: None, splash: splash::Splash::new(), brand_rect: None, file_info: None, focus_step: None, focus_hist: false, upd_drawn: false, set_sec: std::env::var("MODWIRE_SET_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(0), pub_step: 0, proj_q: String::new(), open_steps: [true; 6], start_act: START_ACTION.get().copied().unwrap_or(StartAction::Clean), stable_at: None, confirm_close: false, close_ok: false, draft_at: None, cfg,
+            readonly: matches!(state, Load::ReadOnly), adding: 0, cf_auto_off: false, cur_idx: None, history: history_load(HIST_MAX), hist_q: String::new(), hist_fail: false, hist_all: false, hist_confirm: false, cur: Default::default(), mc_known: vec![], mc_all: vec![], mc_loading: false, mc_next: None, cf_msg: checked_msg(cfg.curse_checked), key_msg: checked_msg(cfg.core_checked), merge_hidden: false, add_shown: false, file_note: String::new(), ctrl_armed: None, splash: splash::Splash::new(), brand_rect: None, file_info: None, focus_step: None, focus_hist: false, upd_drawn: false, ver_open: false, ver_q: String::new(), ver_filter: 0, set_sec: std::env::var("MODWIRE_SET_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(0), pub_step: std::env::var("MODWIRE_PUB_STEP").ok().and_then(|v| v.parse().ok()).unwrap_or(0), proj_q: String::new(), open_steps: [true; 6], start_act: START_ACTION.get().copied().unwrap_or(StartAction::Clean), stable_at: None, confirm_close: false, close_ok: false, draft_at: None, cfg,
         };
         app.restore_draft();
         app
@@ -2560,9 +2616,9 @@ impl App {
         }
     }
 
-    /// Швидкий вибір версій Minecraft (останні релізи з Modrinth) на всю ширину кроку.
+    /// Повідомлення під полем версій: список не звірено, завантажується, невідомі версії.
     fn mc_chips(&mut self, ui: &mut egui::Ui) {
-        let mut typed = parse_mc(&self.cfg.last.mc_versions);
+        let typed = parse_mc(&self.cfg.last.mc_versions);
         if self.mc_all.is_empty() && !typed.is_empty() {
             ui.label(RichText::new("Версії не звірено зі списком (немає зв'язку з Modrinth), перевірить сервер.").color(MUTED).size(HINT_SZ));
         }
@@ -2573,19 +2629,108 @@ impl App {
             });
         }
         if !self.mc_known.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                for v in self.mc_known.iter().take(10) {
-                    let on = typed.contains(v);
-                    if mc_chip(ui, on, v).clicked() {
-                        if on { typed.retain(|t| t != v) } else { typed.push(v.clone()) }
-                        self.cfg.last.mc_versions = typed.join(", ");
-                    }
-                }
-            });
-            let bad: Vec<_> = parse_mc(&self.cfg.last.mc_versions).into_iter().filter(|t| !self.mc_all.contains(t)).collect();
+            let bad: Vec<_> = typed.into_iter().filter(|t| !self.mc_all.contains(t)).collect();
             if !bad.is_empty() {
                 ui.label(RichText::new(i18n::fmt(i18n::tr("Невідомі версії: {}"), &[&(bad.join(", "))])).color(WARN).size(HINT_SZ));
             }
+        }
+    }
+
+    /// 0 — мод, 1 — ресурс-пак, 2 — датапак (за «лоадерами»-маркерами minecraft / datapack).
+    fn pack_kind(&self) -> u8 {
+        let l = &self.cfg.last.loaders;
+        if l.iter().any(|x| x == "minecraft") { 1 } else if l.iter().any(|x| x == "datapack") { 2 } else { 0 }
+    }
+
+    /// Що публікуємо: мод, ресурс-пак чи датапак. Паки не мають лоадерів: лишається маркер для платформ.
+    fn type_ui(&mut self, ui: &mut egui::Ui) {
+        field_label(ui, "Що публікуємо");
+        let cur = self.pack_kind();
+        let busy = self.pending > 0;
+        let kinds = [("Мод", ".jar, потрібен лоадер"), ("Ресурс-пак", ".zip, текстури й звуки"), ("Датапак", ".zip, функції й рецепти")];
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.columns(3, |cols| {
+                for (k, (name, sub)) in kinds.iter().enumerate() {
+                    if kind_card(&mut cols[k], cur as usize == k, name, sub).clicked() && cur as usize != k {
+                        self.cfg.last.loaders.retain(|l| !is_pack_loader(l));
+                        match k {
+                            1 => self.cfg.last.loaders = vec!["minecraft".into()],
+                            2 => self.cfg.last.loaders = vec!["datapack".into()],
+                            _ => {}
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    /// Вікно вибору версій Minecraft: пошук, фільтр, список груп із галочками.
+    fn versions_dialog(&mut self, ctx: &egui::Context) {
+        dialog_focus(ctx, "versions", self.ver_open);
+        if !self.ver_open {
+            return;
+        }
+        let (known, all) = (self.mc_known.clone(), self.mc_all.clone());
+        let before = parse_mc(&self.cfg.last.mc_versions);
+        let mut sel = before.clone();
+        let mut close = false;
+        let r = egui::Modal::new(egui::Id::unique("versions_dialog")).backdrop_color(Color32::from_black_alpha(160)).frame(modal_frame()).show(ctx, |ui| {
+            ui.set_width((ctx.content_rect().width() - 80.0).clamp(300.0, 480.0));
+            ui.horizontal(|ui| {
+                ui.label(title("Версії Minecraft"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if close_x(ui).clicked() { close = true; }
+                });
+            });
+            ui.add_space(8.0);
+            let q = ui.add(egui::TextEdit::singleline(&mut self.ver_q).hint_text("Пошук, напр. 1.20").desired_width(f32::INFINITY).min_size(egui::vec2(0.0, CTRL_H)));
+            name_edit(&q, "Пошук версії Minecraft", "Пошук, напр. 1.20", &self.ver_q);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                for (i, l) in ["Релізи", "Знімки", "Усі"].iter().enumerate() {
+                    if choice(ui, self.ver_filter == i as u8, l).clicked() { self.ver_filter = i as u8; }
+                }
+            });
+            ui.add_space(6.0);
+            let needle = self.ver_q.trim().to_lowercase();
+            let pool: Vec<&String> = match self.ver_filter {
+                0 => known.iter().collect::<Vec<_>>(),
+                1 => all.iter().filter(|v| !known.contains(v)).collect::<Vec<_>>(),
+                _ => all.iter().collect::<Vec<_>>(),
+            };
+            let list: Vec<&String> = pool.into_iter().filter(|v| needle.is_empty() || v.to_lowercase().contains(&needle)).collect();
+            egui::ScrollArea::vertical().id_salt("ver_list").max_height((ctx.content_rect().height() - 300.0).clamp(160.0, 420.0)).auto_shrink([false, true]).show(ui, |ui| {
+                if list.is_empty() {
+                    hint(ui, if all.is_empty() { "Список версій ще не завантажено (немає зв'язку з Modrinth). Можна вписати версії вручну в полі." } else { "Нічого не знайдено." });
+                }
+                let mut last = String::new();
+                for v in list.iter().copied() {
+                    let g = mc_group(v);
+                    if g != last {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(&g).color(MUTED).size(12.0).strong());
+                        last = g;
+                    }
+                    let on = sel.contains(v);
+                    if ver_row(ui, v, on).clicked() {
+                        if on { sel.retain(|x| x != v) } else { sel.push(v.to_string()) }
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                hint(ui, &format!("Обрано: {}", sel.len()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(primary("Готово")).clicked() { close = true; }
+                    if ghost_btn(ui, None, "Очистити").clicked() { sel.clear(); }
+                });
+            });
+        });
+        if sel != before {
+            self.cfg.last.mc_versions = sel.join(", ");
+        }
+        if close || r.should_close() {
+            self.ver_open = false;
         }
     }
 
@@ -2593,7 +2738,7 @@ impl App {
     fn loaders_ui(&mut self, ui: &mut egui::Ui) {
         field_label(ui, i18n::tr("Лоадери *"));
         ui.horizontal_wrapped(|ui| {
-            for l in LOADERS {
+            for l in LOADERS.iter().copied().filter(|l| !is_pack_loader(l)) {
                 let on = self.cfg.last.loaders.iter().any(|x| x == l);
                 if choice(ui, on, loader_label(l)).clicked() {
                     if on { self.cfg.last.loaders.retain(|x| x != l) } else { self.cfg.last.loaders.push(l.into()) }
@@ -2943,11 +3088,20 @@ impl App {
             }); }
 
             if self.pub_step == 3 { step(ui, sp(3, i18n::tr("Сумісність"), true), &mut open[3], |ui| {
-                // усе в одну колонку: чотири лоадери вміщуються в рядок без переносу
+                self.type_ui(ui);
+                ui.add_space(8.0);
                 self.mc_ui(ui, focus == Some(3));
+                ui.horizontal(|ui| {
+                    if ghost_btn(ui, Some(Ic::File), "Обрати версії…").clicked() { self.ver_open = true; }
+                    hint(ui, &format!("Обрано: {}", parse_mc(&self.cfg.last.mc_versions).len()));
+                });
                 self.mc_chips(ui);
                 ui.add_space(8.0);
-                self.loaders_ui(ui);
+                if self.pack_kind() == 0 {
+                    self.loaders_ui(ui);
+                } else {
+                    banner(ui, Kind::Info, "Лоадери не потрібні: ресурс-паки й датапаки працюють без лоадера. Платформи позначать файл автоматично.");
+                }
                 self.step_nav(ui);
             }); }
 
@@ -4133,6 +4287,7 @@ impl eframe::App for App {
             }
         }
         self.merge_dialog(ctx);
+        self.versions_dialog(ctx);
         self.close_dialog(ctx);
         self.update_guard(ctx);
         self.splash.show(ctx, self.brand_rect);
@@ -4491,6 +4646,80 @@ mod tests {
         let seen = tab_walk(&mut app, &mut |a, c| a.update_guard(c));
         eprintln!("rollback_dialog: {seen:?}");
         assert!(!seen.is_empty() && seen.iter().all(|s| s.0 == egui::Order::Foreground), "{seen:?}");
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    /// Крок «Сумісність»: тип файлу, кнопка «Обрати версії…» і вікно вибору працюють без паніки й змінюють дані.
+    #[test]
+    fn compat_step_type_and_version_picker() {
+        use egui::accesskit::Role;
+        let (_g, mut app) = test_app("compat");
+        app.tab = Tab::Publish;
+        app.sel = Some(0);
+        (app.pub_step, app.edit_mode) = (3, true);
+        app.mc_all = vec!["1.20.4".into(), "1.20.1".into(), "24w14a".into()];
+        app.mc_known = vec!["1.20.4".into(), "1.20.1".into()];
+        app.cfg.last.mc_versions = "1.20.1".into();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        setup_style(&ctx);
+        let run = |app: &mut App, ev: Vec<egui::Event>| {
+            let (out, _) = frame(&ctx, ev, &mut |ui| {
+                let c = ui.ctx().clone();
+                egui::CentralPanel::default().show(ui, |ui| app.publish_ui(ui, &c));
+                app.versions_dialog(&c);
+            });
+            let mut found = std::collections::HashMap::new();
+            if let Some(u) = out.platform_output.accesskit_update {
+                for (_, n) in &u.nodes {
+                    if n.role() == Role::Button && let (Some(l), Some(b)) = (n.label(), n.bounds()) {
+                        found.insert(l.to_string(), egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32));
+                    }
+                }
+            }
+            found
+        };
+        let click = |pos: egui::Pos2| -> Vec<Vec<egui::Event>> {
+            let pb = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            vec![vec![egui::Event::PointerMoved(pos)], vec![pb(true)], vec![pb(false)], vec![]]
+        };
+        let mut btns = Default::default();
+        for _ in 0..4 { btns = run(&mut app, vec![]); }
+        // тип «Ресурспак» ставить маркер-лоадер і прибирає лоадери модів
+        app.cfg.last.loaders = vec!["fabric".into()];
+        let pos = *btns.iter().find(|(k, _)| k.starts_with("Ресурс-пак")).map(|(_, v)| v).expect("картка «Ресурс-пак»");
+        for ev in click(pos) { run(&mut app, ev); }
+        assert_eq!(app.pack_kind(), 1, "після кліку по картці — ресурс-пак");
+        assert_eq!(app.cfg.last.loaders, vec!["minecraft".to_string()], "лоадери модів прибрано");
+        // кнопка вибору версій відкриває вікно
+        let pos = *btns.get("Обрати версії…").expect("кнопка «Обрати версії…»");
+        for ev in click(pos) { run(&mut app, ev); }
+        assert!(app.ver_open, "вікно вибору версій відкрилось");
+        let btns = run(&mut app, vec![]);
+        let pos = *btns.get("1.20.4").expect("рядок версії 1.20.4 у вікні");
+        for ev in click(pos) { run(&mut app, ev); }
+        assert!(app.cfg.last.mc_versions.contains("1.20.4") && app.cfg.last.mc_versions.contains("1.20.1"), "{}", app.cfg.last.mc_versions);
+        let btns = run(&mut app, vec![]);
+        let pos = *btns.get("Готово").expect("кнопка «Готово»");
+        for ev in click(pos) { run(&mut app, ev); }
+        assert!(!app.ver_open, "«Готово» закриває вікно");
+        unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
+    }
+
+    #[test]
+    fn version_groups_and_pack_kind() {
+        assert_eq!(crate::mc_group("1.20.4"), "1.20");
+        assert_eq!(crate::mc_group("1.21"), "1.21");
+        assert_eq!(crate::mc_group("1.9.4"), "1.9");
+        assert_eq!(crate::mc_group("24w14a"), "Знімки");
+        assert_eq!(crate::mc_group("1.20-pre1"), "Знімки");
+        let (_g, mut app) = test_app("packkind");
+        app.cfg.last.loaders = vec!["fabric".into()];
+        assert_eq!(app.pack_kind(), 0);
+        app.cfg.last.loaders = vec!["minecraft".into()];
+        assert_eq!(app.pack_kind(), 1);
+        app.cfg.last.loaders = vec!["datapack".into()];
+        assert_eq!(app.pack_kind(), 2);
         unsafe { std::env::remove_var("MODWIRE_CONFIG_DIR") };
     }
 
