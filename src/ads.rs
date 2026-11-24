@@ -12,7 +12,7 @@ pub struct Sponsor {
 pub const SPONSOR: Option<Sponsor> = None; // реклама вимкнена: лишаємо лише донати
 
 /// Куди веде «Підтримати автора» (Ko-fi, Patreon, банка тощо). `None` ховає блок.
-pub const DONATE_URL: Option<&str> = Some("https://example.com/donate"); // ЗАГЛУШКА
+pub const DONATE_URL: Option<&str> = Some("https://paypal.me/vladvf");
 
 #[cfg(test)]
 mod tests {

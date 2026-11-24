@@ -5,7 +5,7 @@
 //! `MODWIRE_NO_SPLASH=1` вимикає заставку. `MODWIRE_SPLASH_AT=<секунди>` заморожує її на цьому моменті
 //! (для знімків режиму `shots`).
 
-use crate::{ACCENT, BG, CF_ORANGE, MR_GREEN, MUTED, ON_ACCENT, TEXT};
+use crate::{BG, BRAND, BRAND_INK, CF_ORANGE, MR_GREEN, MUTED, TEXT};
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 use std::time::{Duration, Instant};
 
@@ -214,7 +214,7 @@ fn paint(painter: &egui::Painter, screen: Rect, t: f32, target: Rect) {
     let (mark, gap) = (220.0 * fit, 32.0 * fit);
     let word = painter.layout_no_wrap("Modwire".into(), egui::FontId::proportional(84.0 * fit), TEXT);
     let tag_font = egui::FontId::proportional(22.0 * fit);
-    let tag = painter.layout_no_wrap("публікація модів".into(), tag_font.clone(), MUTED);
+    let tag = painter.layout_no_wrap(crate::i18n::tr("публікація модів").into(), tag_font.clone(), MUTED);
     let text_w = word.size().x.max(tag.size().x);
     let total_w = mark + gap + text_w;
     let left = screen.center().x - total_w / 2.0;
@@ -227,12 +227,12 @@ fn paint(painter: &egui::Painter, screen: Rect, t: f32, target: Rect) {
     // плитка іконки проявляється під час переходу
     if morph > 0.0 {
         let r = (16.0 * k).min(255.0) as u8;
-        painter.rect_filled(rect, egui::CornerRadius::same(r), ACCENT.gamma_multiply(morph));
+        painter.rect_filled(rect, egui::CornerRadius::same(r), BRAND.gamma_multiply(morph));
     }
 
     let g = geo_lerp(&geo_logo(), &geo_icon(), morph);
-    let ink = ON_ACCENT;
-    let wire_col = lerp_col(ACCENT, ink, morph);
+    let ink = BRAND_INK;
+    let wire_col = lerp_col(BRAND, ink, morph);
     let green = lerp_col(MR_GREEN, ink, morph);
     let orange = lerp_col(CF_ORANGE, ink, morph);
 
@@ -285,10 +285,10 @@ fn paint(painter: &egui::Painter, screen: Rect, t: f32, target: Rect) {
         let slide = 24.0 * fit;
         let font = egui::FontId::proportional(84.0 * fit);
         let mod_g = painter.layout_no_wrap("Mod".into(), font.clone(), TEXT.gamma_multiply(a1 * text_a));
-        let wire_g = painter.layout_no_wrap("wire".into(), font, ACCENT.gamma_multiply(a2 * text_a));
+        let wire_g = painter.layout_no_wrap("wire".into(), font, BRAND.gamma_multiply(a2 * text_a));
         painter.galley(Pos2::new(tx - slide * (1.0 - a1), ty), mod_g, TEXT);
-        painter.galley(Pos2::new(tx + mod_part.size().x - slide * (1.0 - a2), ty), wire_g, ACCENT);
-        let tag_g = painter.layout_no_wrap("публікація модів".into(), tag_font, MUTED.gamma_multiply(a3 * text_a));
+        painter.galley(Pos2::new(tx + mod_part.size().x - slide * (1.0 - a2), ty), wire_g, BRAND);
+        let tag_g = painter.layout_no_wrap(crate::i18n::tr("публікація модів").into(), tag_font, MUTED.gamma_multiply(a3 * text_a));
         painter.galley(Pos2::new(tx, ty + word.size().y + 8.0 * fit + 8.0 * fit * (1.0 - a3)), tag_g, MUTED);
     }
 }
