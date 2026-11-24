@@ -68,11 +68,11 @@ cargo clippy --all-targets
 
 ## Випуск нової версії
 
-1. Підніміть `version` у `Cargo.toml` (наприклад, `0.3.0`).
+1. Підніміть `version` у `Cargo.toml` (наприклад, `0.4.0`).
 2. Створіть тег з цією ж версією й запуште його:
    ```powershell
-   git tag v0.3.0
-   git push origin v0.3.0
+   git tag v0.4.0
+   git push origin v0.4.0
    ```
 3. `release.yml` збере `modwire.exe` і `Modwire.dmg` і додасть їх до релізу разом із файлом `SHA256SUMS` (перевірка завантаження: `sha256sum -c SHA256SUMS`). Якщо тег не збігається з версією в `Cargo.toml`, збірка зупиняється.
 

@@ -70,11 +70,11 @@ cargo clippy --all-targets
 
 ## Releasing a new version
 
-1. Bump `version` in `Cargo.toml` (for example `0.3.0`).
+1. Bump `version` in `Cargo.toml` (for example `0.4.0`).
 2. Create a tag with the same version and push it:
    ```powershell
-   git tag v0.3.0
-   git push origin v0.3.0
+   git tag v0.4.0
+   git push origin v0.4.0
    ```
 3. `release.yml` builds `modwire.exe` and `Modwire.dmg` and attaches them to the release together with a `SHA256SUMS` file (check a download with `sha256sum -c SHA256SUMS`). If the tag does not match the version in `Cargo.toml`, the build stops.
 
