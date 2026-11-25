@@ -111,7 +111,6 @@ struct App {
     featured: bool,                  // Modrinth: рекомендована версія
     send_deps: bool,                 // Modrinth: надсилати залежності з файлу
     extra_files: Vec<PathBuf>,       // Modrinth: додаткові файли (до MAX_EXTRA)
-    mr_link: String,                 // посилання або slug Modrinth у діалозі додавання
     sel_mode: bool,                  // режим вибору для пакетного видалення
     picked: std::collections::HashSet<String>, // id вибраних проєктів
     batch_confirm: bool,
@@ -1365,7 +1364,7 @@ impl App {
         let mut app = Self {
             tab: if cfg.projects.is_empty() { Tab::Projects } else { Tab::Publish }, // у день релізу відразу робочий екран; без проєктів спершу додати
             edit_mode: true, review_now: false, tx, rx, add_open: false, target: None, mr_list: vec![], mr_loading: false, mr_msg: String::new(),
-            cf_id: String::new(), cur_name: String::new(), proj_chk: Chk::Idle, featured: false, send_deps: false, extra_files: vec![], mr_link: String::new(), sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), add_tab: 0, cf_query: String::new(), cf_hits: vec![], cf_loading: false, sel, file: None,
+            cf_id: String::new(), cur_name: String::new(), proj_chk: Chk::Idle, featured: false, send_deps: false, extra_files: vec![], sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), add_tab: 0, cf_query: String::new(), cf_hits: vec![], cf_loading: false, sel, file: None,
             name: String::new(), number: sel.and_then(|i| cfg.projects.get(i)).map(|p| bump(&p.last_number)).unwrap_or_default(), release_type: rt, changelog: String::new(),
             use_mr: true, use_cf: true, mr_res: None, cf_res: None, pending: 0, msg: String::new(),
             show_tokens: false, confirm_del: None, confirm_clear: false, check_msg: checked_msg(cfg.modrinth_checked), up_mr: Up::default(), up_cf: Up::default(), cur_cl: String::new(), cur_meta: Default::default(),
@@ -2466,41 +2465,7 @@ impl App {
                 });
                 ui.add_space(12.0);
                 if self.add_tab == 0 {
-                    // --- Modrinth ---
-                    let lid = field_label(ui, i18n::tr("Посилання або ідентифікатор (slug)"));
-                    let slug = modrinth_slug_input(&self.mr_link);
-                    let mut go = false;
-                    let mut lr = None;
-                    ui.horizontal(|ui| {
-                        let w = (ui.available_width() - 110.0).max(160.0);
-                        lr = Some(ui.add(egui::TextEdit::singleline(&mut self.mr_link).hint_text("modrinth.com/mod/назва").desired_width(w).min_size(egui::vec2(w, 44.0)).align(egui::Align2::LEFT_CENTER)).labelled_by(lid));
-                        go = ui.add_enabled(slug.is_some(), add_green(i18n::tr("btn.add"))).clicked();
-                    });
-                    let lr = lr.expect("поле створено в рядку вище");
-                    if !self.mr_link.trim().is_empty() && slug.is_none() {
-                        field_error(ui, &lr, i18n::tr("Вставте посилання modrinth.com/mod/… або ідентифікатор (slug)"));
-                    }
-                    if just_opened {
-                        lr.request_focus(); // перше поле діалогу
-                    }
-                    if self.mr_link.trim().is_empty() {
-                        hint(ui, "Вставте адресу сторінки мода й натисніть Enter, або оберіть зі списку нижче.");
-                    }
-                    let enter = lr.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if let Some(slug) = slug && (go || enter) {
-                        let (t, target) = (self.cfg.modrinth_token.trim().to_string(), self.target);
-                        self.adding += 1; // Found зменшує лічильник
-                        self.spawn(ctx, move || {
-                            let r = masked(modrinth_lookup(&t, &slug), &[t.as_str()]).map(|(id, title, icon)| {
-                                cache_icon(&icon);
-                                Box::new(Project { name: title, modrinth_id: id, icon_url: icon, ..Default::default() })
-                            });
-                            Msg::Found(target, r)
-                        });
-                        self.mr_link.clear();
-                        self.add_open = false;
-                    }
-                    ui.add_space(12.0);
+                    // --- Modrinth: лише список ваших проєктів (поле посилання прибрано, щоб списку було більше місця) ---
                     labeled_divider(ui, &i18n::fmt(i18n::tr("Ваші проєкти на {}"), &[&"Modrinth"]));
                     ui.add_space(6.0);
                     let has_token = !self.cfg.modrinth_token.trim().is_empty();
@@ -2547,7 +2512,7 @@ impl App {
                         banner(ui, Kind::Error, &self.mr_msg);
                     }
                     let mut pick = None;
-                    egui::ScrollArea::vertical().id_salt("mr_list").max_height((ctx.content_rect().height() * 0.4).clamp(150.0, 320.0)).auto_shrink([false, true]).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("mr_list").max_height((ctx.content_rect().height() - 420.0).clamp(200.0, 560.0)).auto_shrink([false, true]).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 8.0;
                         if self.mr_list.is_empty() {
                             if self.mr_loading {

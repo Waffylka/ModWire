@@ -219,18 +219,6 @@ pub fn parse_project_link(s: &str) -> Option<Link> {
     }
 }
 
-/// Slug для пошуку на Modrinth: з посилання modrinth.com або голе слово (slug/id); інше (чужі посилання, пробіли) = None.
-pub fn modrinth_slug_input(s: &str) -> Option<String> {
-    match parse_project_link(s) {
-        Some(Link::Modrinth(x)) => Some(x),
-        Some(_) => None,
-        None => {
-            let t = s.trim();
-            (!t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))).then(|| t.to_string())
-        }
-    }
-}
-
 /// (id, назва, іконка) проєкту Modrinth за slug або id; токен не обов'язковий (публічні проєкти).
 pub fn modrinth_lookup(token: &str, slug: &str) -> Result<(String, String, String), String> {
     if !slug_ok(slug) {
@@ -2248,10 +2236,6 @@ mod tests {
         assert_eq!(parse_project_link("https://www.modrinth.com/plugin/x_y.z"), Some(Modrinth("x_y.z".into())));
         assert_eq!(parse_project_link("https://www.curseforge.com/minecraft/mc-mods/jei/files"), Some(CurseSlug("jei".into())));
         assert_eq!(parse_project_link("https://www.curseforge.com/projects/238222"), Some(CurseId("238222".into())));
-        assert_eq!(modrinth_slug_input("sodium").as_deref(), Some("sodium"));
-        assert_eq!(modrinth_slug_input("https://modrinth.com/mod/sodium").as_deref(), Some("sodium"));
-        assert_eq!(modrinth_slug_input("https://curseforge.com/projects/5"), None);
-        assert_eq!(modrinth_slug_input("a/b"), None);
         for bad in ["sodium", "123456", "https://modrinth.com.evil.org/mod/x", "https://evil.org/modrinth.com/mod/x", "https://modrinth.com/mod/", "https://modrinth.com/user/x", "https://curseforge.com/projects/abc", "https://modrinth.com/mod/a b"] {
             assert_eq!(parse_project_link(bad), None, "{bad}");
         }
