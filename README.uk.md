@@ -61,7 +61,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-- Windows: рекомендовано короткий шлях для збірки, інакше можливий LNK1104: `$env:CARGO_TARGET_DIR='C:/mp-target'`.
+- Windows: якщо в шляху до теки проєкту є кирилиця, лінкер може впасти з LNK1104; тримайте проєкт у теці з латинською назвою (напр. `Документи\modwire`) або задайте `$env:CARGO_TARGET_DIR='C:/mp-target'`.
 - macOS: збирається лише на macOS. GitHub Actions (`.github/workflows/release.yml`) робить Windows `.exe` та універсальний `.dmg` (aarch64 + x86_64).
 - Тести перевіряють логіку й мережеві сценарії на локальному моку, реальні API не викликаються.
 - CI (`.github/workflows/ci.yml`): clippy + тести на Windows і macOS при push у `main` і для pull request.

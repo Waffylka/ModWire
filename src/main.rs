@@ -1326,7 +1326,19 @@ fn token_field(ui: &mut egui::Ui, value: &mut String, show: &mut bool) -> bool {
 
 fn icon(ui: &mut egui::Ui, url: &str, name: &str, size: f32) {
     // Читаємо байти самі: завантажувач file:// у Windows не знаходив кешовані іконки.
-    let cached = icon_path(url).filter(|p| !url.is_empty() && p.exists()).and_then(|p| std::fs::read(&p).ok().map(|b| (p, b)));
+    // байти іконки читаємо з диска один раз і тримаємо в пам'яті: читання на кожному кадрі давало ривки анімацій
+    thread_local! {
+        static ICONS: std::cell::RefCell<std::collections::HashMap<String, (std::path::PathBuf, egui::load::Bytes)>> = Default::default();
+    }
+    let cached = if url.is_empty() { None } else {
+        ICONS.with_borrow_mut(|m| {
+            if let Some(v) = m.get(url) { return Some(v.clone()); }
+            let p = icon_path(url).filter(|p| p.exists())?;
+            let b: egui::load::Bytes = std::fs::read(&p).ok()?.into();
+            m.insert(url.to_string(), (p.clone(), b.clone()));
+            Some((p, b))
+        })
+    };
     match cached {
         Some((p, bytes)) => {
             let uri = format!("bytes://{}", p.to_string_lossy().replace('\\', "/"));
@@ -1362,7 +1374,7 @@ impl App {
         let sel = (l.project < cfg.projects.len()).then_some(l.project);
         let rt = RELEASE_TYPES.iter().position(|r| *r == l.release_type).unwrap_or(0);
         let mut app = Self {
-            tab: if cfg.projects.is_empty() { Tab::Projects } else { Tab::Publish }, // у день релізу відразу робочий екран; без проєктів спершу додати
+            tab: Tab::Projects,
             edit_mode: true, review_now: false, tx, rx, add_open: false, target: None, mr_list: vec![], mr_loading: false, mr_msg: String::new(),
             cf_id: String::new(), cur_name: String::new(), proj_chk: Chk::Idle, featured: false, send_deps: false, extra_files: vec![], sel_mode: false, picked: Default::default(), batch_confirm: false, merge_ask: vec![], centered: false, add_msg: String::new(), add_tab: 0, cf_query: String::new(), cf_hits: vec![], cf_loading: false, sel, file: None,
             name: String::new(), number: sel.and_then(|i| cfg.projects.get(i)).map(|p| bump(&p.last_number)).unwrap_or_default(), release_type: rt, changelog: String::new(),

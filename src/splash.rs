@@ -7,7 +7,6 @@
 
 use crate::{BG, BRAND, BRAND_INK, CF_ORANGE, MR_GREEN, MUTED, TEXT};
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
-use std::time::{Duration, Instant};
 
 /// Моменти шкали часу, секунди.
 const T_PULSE: f32 = 1.5; // старт імпульсу по дроту
@@ -17,7 +16,8 @@ const T_MORPH_LEN: f32 = 0.7;
 pub const T_TOTAL: f32 = T_MORPH + T_MORPH_LEN;
 
 pub struct Splash {
-    start: Instant,
+    t: f32,      // час анімації з першого показаного кадру (накопичується з кроку кадру)
+    shown: bool, // перший кадр уже був
     id: egui::Id,
     done: bool,
     frozen: Option<f32>,
@@ -29,7 +29,7 @@ impl Splash {
         let frozen = std::env::var("MODWIRE_SPLASH_AT").ok().and_then(|v| v.parse::<f32>().ok());
         // у режимі знімків заставки немає, якщо її явно не заморожено на потрібному моменті
         let shots = std::env::var_os("MODWIRE_SHOT_DIR").is_some_and(|v| !v.is_empty());
-        Self { start: Instant::now(), id: egui::Id::unique("splash"), done: off || (shots && frozen.is_none()), frozen }
+        Self { t: 0.0, shown: false, id: egui::Id::unique("splash"), done: off || (shots && frozen.is_none()), frozen }
     }
 
     pub fn done(&self) -> bool {
@@ -41,7 +41,15 @@ impl Splash {
         if self.done {
             return;
         }
-        let t = self.frozen.unwrap_or_else(|| self.start.elapsed().as_secs_f32());
+        // Час рахуємо від першого показаного кадру й крок обмежуємо 1/30 с: повільний старт (створення вікна,
+        // шрифти) не «з'їдає» початок, а випадковий довгий кадр не дає ривка — анімація лише трохи сповільнюється.
+        if self.frozen.is_none() {
+            if self.shown {
+                self.t += ctx.input(|i| i.stable_dt).clamp(0.0, 1.0 / 30.0);
+            }
+            self.shown = true;
+        }
+        let t = self.frozen.unwrap_or(self.t);
         if t >= T_TOTAL && self.frozen.is_none() {
             self.done = true;
             return;
@@ -58,9 +66,9 @@ impl Splash {
             skip |= t < T_MORPH && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })));
             if skip {
                 // ранній вихід: одразу до переходу в рейку
-                self.start = Instant::now() - Duration::from_secs_f32(T_MORPH);
+                self.t = self.t.max(T_MORPH);
             }
-            ctx.request_repaint_after(Duration::from_millis(16)); // ≈60 кадрів/с, без гонки за кожен vsync
+            ctx.request_repaint(); // кадр на кожен vsync: рівний рух без розбіжності таймера з частотою екрана
         }
     }
 }

@@ -63,7 +63,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-- Windows: a short build path is recommended to avoid LNK1104: `$env:CARGO_TARGET_DIR='C:/mp-target'`.
+- Windows: if the project folder path contains non-ASCII characters (e.g. Cyrillic), the linker can fail with LNK1104; keep the project in an ASCII path (e.g. `Documents\modwire`) or set `$env:CARGO_TARGET_DIR='C:/mp-target'`.
 - macOS: builds on macOS only. GitHub Actions (`.github/workflows/release.yml`) produces the Windows `.exe` and a universal `.dmg` (aarch64 + x86_64).
 - Tests cover logic and network scenarios against a local mock; real APIs are never called.
 - CI (`.github/workflows/ci.yml`): clippy and tests on Windows and macOS for pushes to `main` and for pull requests.
