@@ -368,7 +368,16 @@ pub fn fmt(tmpl: &str, args: &[&dyn std::fmt::Display]) -> String {
 
 /// Рядок поточної мови за ключем (ключ або український текст). Невідомий ключ повертається як є.
 pub fn tr(key: &'static str) -> &'static str {
-    match TABLE.iter().find(|r| r.0 == key) {
+    // key -> row index, built once; the first row wins, as with the linear search it replaces
+    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, usize>> = std::sync::OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let mut m = std::collections::HashMap::with_capacity(TABLE.len());
+        for (i, r) in TABLE.iter().enumerate() {
+            m.entry(r.0).or_insert(i);
+        }
+        m
+    });
+    match index.get(key).map(|&i| &TABLE[i]) {
         Some(r) => match lang() {
             Lang::Uk => r.1,
             Lang::En => r.2,

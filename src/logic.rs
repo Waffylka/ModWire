@@ -1466,24 +1466,44 @@ pub fn modrinth_projects(token: &str) -> Result<Vec<MrProject>, String> {
 
 /// (назва, url іконки) проєкту Modrinth за id/slug.
 pub fn modrinth_project_info(token: &str, id: &str) -> Result<(String, String), String> {
-    let v = mr_get(&client_t(20)?, token, &format!("/project/{id}"))?;
+    modrinth_project_info_with(&client_t(20)?, token, id)
+}
+
+fn modrinth_project_info_with(c: &Client, token: &str, id: &str) -> Result<(String, String), String> {
+    let v = mr_get(c, token, &format!("/project/{id}"))?;
     Ok((v["title"].as_str().ok_or("немає назви проєкту")?.into(), v["icon_url"].as_str().unwrap_or("").into()))
 }
 
 /// Оновлені (modrinth_id, curse_id, назва, іконка) для проєктів, що відповіли; помилки окремих проєктів пропускаються.
+/// Один клієнт на всі запити (без нового TLS-з'єднання на кожен проєкт) і не більше 3 запитів одночасно.
 pub fn refresh_projects(mr_token: &str, core_key: &str, ps: &[Project]) -> Vec<(String, String, String, String)> {
-    ps.iter()
-        .filter_map(|p| {
-            let info = if !p.modrinth_id.is_empty() && !mr_token.is_empty() {
-                modrinth_project_info(mr_token, &p.modrinth_id).ok()
-            } else if !p.curse_id.is_empty() && !core_key.is_empty() {
-                curse_mod_info(core_key, &p.curse_id).ok()
-            } else {
-                None
-            }?;
-            Some((p.modrinth_id.clone(), p.curse_id.clone(), info.0, info.1))
-        })
-        .collect()
+    let Ok(client) = client_t(20) else { return Vec::new() };
+    let fetch = |p: &Project| -> Option<(String, String, String, String)> {
+        let info = if !p.modrinth_id.is_empty() && !mr_token.is_empty() {
+            modrinth_project_info_with(&client, mr_token, &p.modrinth_id).ok()
+        } else if !p.curse_id.is_empty() && !core_key.is_empty() {
+            curse_mod_info_with(&client, core_key, &p.curse_id).ok()
+        } else {
+            None
+        }?;
+        Some((p.modrinth_id.clone(), p.curse_id.clone(), info.0, info.1))
+    };
+    // three workers pull projects from a shared counter: latency overlaps, but the load stays small
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results = std::sync::Mutex::new(vec![None; ps.len()]);
+    std::thread::scope(|s| {
+        for _ in 0..ps.len().min(3) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(p) = ps.get(i) else { break };
+                    let r = fetch(p);
+                    results.lock().unwrap_or_else(|e| e.into_inner())[i] = r;
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().flatten().collect()
 }
 
 /// Числові частини номера ("1.0.10-beta" -> [1,0,10]) для порівняння версій.
@@ -1505,7 +1525,11 @@ pub fn version_warning(number: &str, project: &str, last_number: &str, history: 
 }
 
 pub fn curse_mod_info(key: &str, id: &str) -> Result<(String, String), String> {
-    let r = client_get()?.get(format!("{}/v1/mods/{id}", core())).header("x-api-key", key).send();
+    curse_mod_info_with(&client_get()?, key, id)
+}
+
+fn curse_mod_info_with(c: &Client, key: &str, id: &str) -> Result<(String, String), String> {
+    let r = c.get(format!("{}/v1/mods/{id}", core())).header("x-api-key", key).send();
     parse_curse_mod(&json_of(r.map_err(net_err)?)?).ok_or_else(|| "немає назви мода".into())
 }
 
