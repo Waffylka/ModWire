@@ -1465,10 +1465,6 @@ pub fn modrinth_projects(token: &str) -> Result<Vec<MrProject>, String> {
 }
 
 /// (назва, url іконки) проєкту Modrinth за id/slug.
-pub fn modrinth_project_info(token: &str, id: &str) -> Result<(String, String), String> {
-    modrinth_project_info_with(&client_t(20)?, token, id)
-}
-
 fn modrinth_project_info_with(c: &Client, token: &str, id: &str) -> Result<(String, String), String> {
     let v = mr_get(c, token, &format!("/project/{id}"))?;
     Ok((v["title"].as_str().ok_or("немає назви проєкту")?.into(), v["icon_url"].as_str().unwrap_or("").into()))
