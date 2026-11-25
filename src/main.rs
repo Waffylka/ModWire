@@ -2506,8 +2506,11 @@ impl App {
                     let has_token = !self.cfg.modrinth_token.trim().is_empty();
                     let mut clicked = false;
                     if has_token {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            clicked = ui.add_enabled_ui(!self.mr_loading, |ui| ghost_btn(ui, Some(Ic::Refresh), if self.mr_list.is_empty() { i18n::tr("Завантажити мої проєкти") } else { i18n::tr("Оновити список") })).inner.clicked();
+                        // рядок обмежує висоту: голий right_to_left забрав би всю висоту й зсунув список униз
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                clicked = ui.add_enabled_ui(!self.mr_loading, |ui| ghost_btn(ui, Some(Ic::Refresh), if self.mr_list.is_empty() { i18n::tr("Завантажити мої проєкти") } else { i18n::tr("Оновити список") })).inner.clicked();
+                            });
                         });
                         ui.add_space(6.0);
                     }
@@ -2691,8 +2694,10 @@ impl App {
                 let (sep, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
                 ui.painter().hline(sep.x_range(), sep.center().y, Stroke::new(1.0, BORDER));
                 ui.add_space(10.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ghost_btn(ui, None, i18n::tr("btn.close")).clicked() { close = true; }
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ghost_btn(ui, None, i18n::tr("btn.close")).clicked() { close = true; }
+                    });
                 });
             });
         if close || ((self.merge_ask.is_empty() || self.merge_hidden) && r.should_close()) {
